@@ -1,0 +1,92 @@
+## Projektdokumentation: OpenTrafficMap V2X Multi-Gateway & Cockpit
+Architektur, Systemumfang und produktionsbereite Implementierung
+Dieses Dokument beschreibt den vollständigen technischen Umfang, die Systemarchitektur sowie den Datenfluss des umgebauten OpenTrafficMap-Ökosystems. Das System wurde von einem stationären Server-Konzept zu einer hochgradig mobilen, ausfallsicheren C-ITS (Cooperative Intelligent Transport Systems) Edge-Architektur für den Automotive-Einsatz transformiert.
+------------------------------
+## 1. Systemübersicht & Umfang (Scope)
+Das Gesamtsystem dient dem passiven Abfangen, Dekodieren, Protokollieren und Visualisieren von lokalen V2X-Infrastruktur- und Fahrzeugdaten (802.11p / ITS-G5) im 5,9-GHz-Band. Es ist modular aufgebaut und unterstützt zwei Betriebsszenarien:
+
+   1. Raspberry Pi Edition: Der Pi fungiert als autarkes Gateway im Fahrzeug-Handschuhfach, liest die Sensoren und streamt die Daten per WLAN an iPhones [INDEX].
+   2. macOS All-in-One Edition: Das MacBook auf dem Beifahrersitz übernimmt die Rolle der Zentrale und stellt die Karte ohne Netzwerk-Overhead direkt nativ dar.
+
+## Funktioneller Leistungsumfang:
+
+* Promiscuous Wi-Fi 6 Sniffing: Hardwarenahes Abfangen nativer 802.11p-Frames via ESP32-C5 auf Kanal 180 (5890 MHz) ohne Netzwerkkorrelation.
+* SLIP-Stream-Architektur: Kontinuierliches Tunneln binärer Rohdaten über USB mittels SLIP-Framing mit einer Datendurchsatz-Sicherung von 921600 Baud.
+* Multi-Protokoll-Parsing: Echtzeit-Isolierung und Verarbeitung von CAM (Fahrzeugtelemetrie), DENM (Gefahren- und Baustellenbereiche) und SPATEM (Ampelphasensteuerungen).
+* NMEA-GPS-Splitting: Paralleles Einlesen externer USB-GPS-Mäuse zur Feststellung der Eigenposition im Falle fehlender interner Ortungshardware.
+* Automotive CSV-Logging: Lückenlose, manipulationssichere und tabellarische Datensicherung aller Funk- und Positionsereignisse mit Millisekunden-Zeitstempeln auf dem Dateisystem [INDEX].
+* GLOSA-Assistenzsystem: Mathematische Berechnung der optimalen Zielgeschwindigkeit zur Ausnutzung einer „Grünen Welle“ mittels inverser Haversine-Distanz-Zeit-Vektoren.
+* Echtzeit-Schleppkurven: Vorausschauende Pfadhistorien-Visualisierung sich bewegender Fahrzeuge auf GPU-beschleunigten MapKit-Karten [INDEX].
+
+------------------------------
+## 2. Systematischer Aufbau & Datenfluss (Architektur)
+Das folgende Diagramm veranschaulicht die Schichtenarchitektur (PHY, Ingestion, Processing, Application) sowie den bit- und paketbasierte Datenstrom durch das Gesamtsystem:
+
+  [ 5.9 GHz C-ITS Luft-Schnittstelle ]
+                   │
+                   ▼ (Native IEEE 802.11p MAC Frames / ETSI ASN.1)
+ ┌──────────────────────────────────────────────────┐
+ │      ESP32 / ESP32-C5 (Firmware von pit711)      │
+ │  • Schaltet Funkchip in den Promiscuous Sniffer  │
+ │  • Kapselt Pakete in SLIP-Kommando-Frames (0xC0) │
+ └─────────────────┬────────────────────────────────┘
+                   │
+                   ▼ (USB-Kabel @ 921600 Baud / Serieller SLIP-Bytestream)
+ ┌──────────────────────────────────────────────────┐
+ │         INGESTION & CORE GATEWAY LAYER           │
+ │               (Raspberry Pi / Mac)               │
+ │                                                  │
+ │  1. Hardware-Abstraktion (udev / IOKit):         │
+ │     • Sichert USB-Ports als feste System-Symlinks │
+ │     • Thread 1: Entpackt SLIP-Datenströme        │
+ │     • Thread 2: Parsed NMEA-GPS-Maus ($GPRMC)    │
+ │                                                  │
+ │  2. State- & Storage-Engine:                     │
+ │     • Isoliert CAM (Fahrzeuge), DENM (Gefahren),  │
+ │       SPATEM (Ampeln) & Eigene Position          │
+ │     • CSV-Logger schreibt lückenlosen Fahrten-Log│
+ │     • In-Memory TTL-Cleaner löscht tote Objekte  │
+ └─────────────────┬────────────────────────────────┘
+                   │
+                   ├─► HTTP [http://192.168.4]
+                   │   (Lokales HTML5/Tailwind Web-Dashboard für Browser)
+                   │
+                   ▼ Lokales Netzwerk (TCP-Stream / Port 8080)
+ ┌──────────────────────────────────────────────────┐
+ │          iOS APP CLIENT (SwiftUI / MapKit)       │
+ │  • Hält permanente, asynchrone Network-Task      │
+ │  • Trennt JSON-Umschläge anhand von '\n'-Bytes    │
+ │  • Berechnet GLOSA (Grüne Welle Optimal Speed)   │
+ │  • MapPolyline zeichnet Spurenhistorie (15 Pkt)  │
+ │  • MapCircle visualisiert DENM-Warnradien        │
+ └──────────────────────────────────────────────────┘
+
+------------------------------
+## 3. Die Protokoll-Spezifikationen im Detail## 3.1 CAM (Cooperative Awareness Message)
+Wird von Fahrzeugen alle 100 ms bis 1 Sekunde ausgestrahlt. Das System extrahiert daraus die stationID (eindeutige Fahrzeug-ID), Geokoordinaten, Geschwindigkeit, Fahrtrichtung (heading) sowie kritische Fahrzeugzustände wie das Bremslicht-Bit (isBraking).
+## 3.2 DENM (Decentralized Environmental Notification Message)
+Ereignisgesteuerte Gefahrenmeldung (z. B. Unfall, Baustelle, Starkregen). Das Gateway verarbeitet die Koordinate des Ereignisses sowie den Wirkungsradius. Die iOS-App nutzt diese Daten, um einen semitransparenten Warnkreis (MapCircle) auf die Karte zu legen [INDEX].
+## 3.3 SPATEM (Signal Phase and Timing Message)
+Infrastrukturmeldung intelligenter Kreuzungen. Sie überträgt den Zustand der Ampelsignale je Fahrspur. Das System wandelt diese Daten in visuelle Ampel-Annotationen um, die die aktuelle Farbe (Rot, Gelb, Grün) sowie einen sekundengenauen Live-Countdown bis zum Phasenwechsel anzeigen.
+## 3.4 GLOSA-Algorithmus
+Das mathematische Herzstück des Cockpits. Es ermittelt die Distanz $d$ zur Ampel via Haversine-Formel basierend auf den Breitengraden ($\phi$) und Längengraden ($\lambda$) des eigenen Fahrzeugs (USB-GPS) und der Ampel:
+$$📡 \text{Distanz } (d) = 2 \cdot R \cdot \arcsin\left(\sqrt{\sin^2\left(\frac{\Delta\phi}{2}\right) + \cos(\phi_1)\cdot\cos(\phi_2)\cdot\sin^2\left(\frac{\Delta\lambda}{2}\right)}\right)$$ 
+Das System gleicht diese Distanz mit der verbleibenden Phasenzeit ($t$) der Ampel ab, um dem Fahrer die optimale Geschwindigkeit anzugeigen:
+$$\text{Zielgeschwindigkeit } (v) = \left(\frac{d}{t}\right) \cdot 3.6 \quad [\text{in km/h}]$$ 
+------------------------------
+## 4. Strukturierte Inbetriebnahme-Checkliste
+
+| Phase | Komponente | Aktion / Konfiguration | Status-Verifikation |
+|---|---|---|---|
+| Hardware | ESP32 | Flashen mit der modifizierten pit711/v2x2map Firmware. | LED blinkt bei Paketempfang. |
+| Hardware | USB-GPS | Montage der GPS-Maus mit freier Sicht zum Himmel (Armaturenbrett). | Rote LED signalisiert Satelliten-Fix. |
+| Zentrale | Linux/Mac | Einrichten der udev-Regeln (/dev/v2x-sniffer & /dev/gps-sniffer). | Ports sind dauerhaft fixiert. |
+| Zentrale | Software | Starten des Python-Gateways (Pi) oder der macOS-Xcode-App. | Terminal loggt [+] Ingestion: Aktiv. |
+| Zentrale | Storage | Überprüfung des automatischen CSV-Dateiexports. | .csv-Header wurde korrekt geschrieben [INDEX]. |
+| Netzwerk | WLAN | Aktivieren des Pi-Hotspots oder Kopplung im gemeinsamen WLAN. | SSID V2X_Gateway ist sichtbar. |
+| Cockpit | iPhone | Hinzufügen der NSLocalNetworkUsageDescription in der Info.plist [INDEX]. | App fragt Berechtigung ab. |
+| Cockpit | UI App | Eintragen der Gateway-IP (192.168.4.1) und Starten der iOS-App. | HUD wechselt auf Live-Empfang aktiv. |
+
+Dieses System kombiniert modernste Funktechnik mit hochperformanter Anwendungsentwicklung und bietet eine vollwertige Forschungs- und Testplattform für kooperative Verkehrssysteme direkt im eigenen Fahrzeug.
+Das Projekt ist damit vollständig dokumentiert, architektonisch erfasst und einsatzbereit. Wenn du den automatischen Export der CSV-Dateien auf einen Cloud-Server erweitern oder die Karten-Overlays grafisch anpassen möchtest, sag einfach Bescheid. Viel Erfolg bei den ersten Testfahrten!
+

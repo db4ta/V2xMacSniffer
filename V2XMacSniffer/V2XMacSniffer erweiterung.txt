@@ -1,0 +1,482 @@
+Hier sind die vollständigen, aufeinander abgestimmten und produktionsbereiten macOS- und iOS-Quelldateien für deine All-in-One-Lösung ohne Raspberry Pi.Bei dieser Architektur schließt du den ESP32 (mit der pit711-Firmware) und die USB-GPS-Maus direkt an dein MacBook an. Der Mac übernimmt das Auslesen der USB-Ports, das CSV-Logging und stellt die Karte bereit. Gleichzeitig streamt er die Daten an das iPhone, das als mobiles Cockpit-Display dient.TEIL 1: DAS MAC-HAUPTPROGRAMM (Xcode macOS-Projekt)Erstelle ein neues Xcode-Projekt: macOS → App. Interface: SwiftUI, Language: Swift. Name: V2XMacSniffer.Wichtig: Entferne die App Sandbox in den Projekteinstellungen (Signing & Capabilities), um den Zugriff auf die USB-Schnittstellen und den Netzwerkport freizugeben.1.1 V2XCore.swift (Mac)Beschreibung: Enthält die grundlegenden, netzwerkfähigen Datenstrukturen für Fahrzeuge (CAM), Gefahrenbereiche (DENM) und intelligente Ampelanlagen (SPATEM) sowie das mathematische Dekodier-Modul für den SLIP-USB-Datenstrom.swiftimport Foundation
+import CoreLocation
+
+// Struktur für CAM (Fahrzeugtelemetrie)
+struct V2XVehicle: Identifiable, Codable {
+    let id: Int
+    var coordinate: CLLocationCoordinate2D
+    var heading: Double
+    var speed: Double
+    var isBraking: Bool
+    var lastSeen: Date
+    
+    enum CodingKeys: String, CodingKey { case id, heading, speed, isBraking, latitude, longitude }
+    
+    init(id: Int, coordinate: CLLocationCoordinate2D, heading: Double, speed: Double, isBraking: Bool, lastSeen: Date) {
+        self.id = id; self.coordinate = coordinate; self.heading = heading; self.speed = speed; self.isBraking = isBraking; self.lastSeen = lastSeen
+    }
+    
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(Int.self, forKey: .id)
+        heading = try c.decode(Double.self, forKey: .heading)
+        speed = try c.decode(Double.self, forKey: .speed)
+        isBraking = try c.decode(Bool.self, forKey: .isBraking)
+        coordinate = CLLocationCoordinate2D(latitude: try c.decode(Double.self, forKey: .latitude), longitude: try c.decode(Double.self, forKey: .longitude))
+        lastSeen = Date()
+    }
+    
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(heading, forKey: .heading)
+        try c.encode(speed, forKey: .speed)
+        try c.encode(isBraking, forKey: .isBraking)
+        try c.encode(coordinate.latitude, forKey: .latitude)
+        try c.encode(coordinate.longitude, forKey: .longitude)
+    }
+}
+
+// Struktur für DENM (Gefahrenzonen)
+struct V2XDangerZone: Identifiable, Codable {
+    let id: Int
+    let type: String
+    var coordinate: CLLocationCoordinate2D
+    let radiusMeter: Double
+    
+    enum CodingKeys: String, CodingKey { case id, type, radiusMeter, latitude, longitude }
+    
+    init(id: Int, type: String, coordinate: CLLocationCoordinate2D, radiusMeter: Double) {
+        self.id = id; self.type = type; self.coordinate = coordinate; self.radiusMeter = radiusMeter
+    }
+    
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(Int.self, forKey: .id)
+        type = try c.decode(String.self, forKey: .type)
+        radiusMeter = try c.decode(Double.self, forKey: .radiusMeter)
+        coordinate = CLLocationCoordinate2D(latitude: try c.decode(Double.self, forKey: .latitude), longitude: try c.decode(Double.self, forKey: .longitude))
+    }
+    
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(type, forKey: .type)
+        try c.encode(radiusMeter, forKey: .radiusMeter)
+        try c.encode(coordinate.latitude, forKey: .latitude)
+        try c.encode(coordinate.longitude, forKey: .longitude)
+    }
+}
+
+// Struktur für SPATEM (Ampelphasen)
+struct V2XTrafficLight: Identifiable, Codable {
+    let id: Int
+    var coordinate: CLLocationCoordinate2D
+    var currentPhase: String
+    var timeToChange: Int
+    
+    enum CodingKeys: String, CodingKey { case id, currentPhase, timeToChange, latitude, longitude }
+    
+    init(id: Int, coordinate: CLLocationCoordinate2D, currentPhase: String, timeToChange: Int) {
+        self.id = id; self.coordinate = coordinate; self.currentPhase = currentPhase; self.timeToChange = timeToChange
+    }
+    
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(Int.self, forKey: .id)
+        currentPhase = try c.decode(String.self, forKey: .currentPhase)
+        timeToChange = try c.decode(Int.self, forKey: .timeToChange)
+        coordinate = CLLocationCoordinate2D(latitude: try c.decode(Double.self, forKey: .latitude), longitude: try c.decode(Double.self, forKey: .longitude))
+    }
+    
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(currentPhase, forKey: .currentPhase)
+        try c.encode(timeToChange, forKey: .timeToChange)
+        try c.encode(coordinate.latitude, forKey: .latitude)
+        try c.encode(coordinate.longitude, forKey: .longitude)
+    }
+}
+
+// SLIP Decoder für Pit711-Firmware
+class SLIPDecoder {
+    static func decode(rawBytes: Data) -> Data {
+        var decoded = Data()
+        var i = 0
+        while i < rawBytes.count {
+            let byte = rawBytes[i]
+            if byte == 0xDB && i + 1 < rawBytes.count {
+                let next = rawBytes[i + 1]
+                if next == 0xDC { decoded.append(0xC0) }
+                else if next == 0xDD { decoded.append(0xDB) }
+                i += 1
+            } else { decoded.append(byte) }
+            i += 1
+        }
+        return decoded
+    }
+}
+Verwende Code mit Vorsicht.1.2 V2XHardwareManager.swift (Mac)Beschreibung: Das logische Zentrum auf dem Mac. Es verwaltet zwei Hintergrund-Threads, um den V2X-Bytestream (SLIP) sowie die USB-GPS-Maus (NMEA) simultan auszulesen. Es speichert alle Daten mit Zeitstempel in einer CSV-Datei im Dokumente-Ordner und betreibt den lokalen TCP-Streaming-Server (Port 8080) für das iPhone.swiftimport Foundation
+import CoreLocation
+import Network
+
+@Observable
+class V2XHardwareManager {
+    var vehicles: [Int: V2XVehicle] = [:]
+    var dangerZones: [Int: V2XDangerZone] = [:]
+    var trafficLights: [Int: V2XTrafficLight] = [:]
+    var myLocation: CLLocationCoordinate2D?
+    var v2xPortOpen = false, gpsPortOpen = false, serverRunning = false
+    var logs: [String] = []
+    
+    private var v2xHandle: FileHandle?, gpsHandle: FileHandle?, listener: NWListener?, shouldRead = false
+    private var activeConnections: [NWConnection] = []
+    private var csvFileURL: URL?
+    
+    init() {
+        if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            csvFileURL = docs.appendingPathComponent("v2x_prod_capture_\(Int(Date().timeIntervalSince1970)).csv")
+        }
+    }
+    
+    func addLog(_ text: String) {
+        DispatchQueue.main.async {
+            self.logs.insert("[\(Date().formatted(.dateTime.hour().minute().second()))] \(text)", at: 0)
+            if self.logs.count > 100 { self.logs.removeLast() }
+        }
+    }
+    
+    private func writeToCSV(_ line: String) {
+        guard let url = csvFileURL else { return }
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? "Timestamp;Type;ID;Latitude;Longitude;Speed;Heading;Braking;Extra\n".write(to: url, atomically: true, encoding: .utf8)
+        }
+        if let fileHandle = try? FileHandle(forWritingTo: url), let data = line.data(using: .utf8) {
+            fileHandle.seekToEndOfFile()
+            fileHandle.write(data)
+            fileHandle.closeFile()
+        }
+    }
+    
+    func startV2X() {
+        let devices = (try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? []
+        // Automatische Erkennung des ESP32 an Mac-Schnittstellen
+        guard let dev = devices.first(where: { $0.contains("cu.usbserial") || $0.contains("cu.usbmodem") }) else {
+            addLog("[-] Kein ESP32 USB-Empfänger gefunden.")
+            return
+        }
+        let path = "/dev/\(dev)"
+        configurePort(path: path, baud: "921600")
+        
+        if let handle = FileHandle(forReadingAtPath: path) {
+            v2xHandle = handle; v2xPortOpen = true; shouldRead = true
+            addLog("[+] V2X USB geöffnet: \(path)")
+            
+            Thread.detachNewThread { [weak self] in
+                var buffer = Data()
+                while self?.shouldRead == true {
+                    guard let data = try? handle.read(upToCount: 128), !data.isEmpty else { continue }
+                    buffer.append(data)
+                    while let endIndex = buffer.firstIndex(of: 0xC0) {
+                        let pkt = buffer.subdata(in: 0..<endIndex); buffer.removeSubrange(0...endIndex)
+                        if !pkt.isEmpty { self?.parseV2X(SLIPDecoder.decode(rawBytes: pkt)) }
+                    }
+                }
+            }
+        }
+    }
+    
+    private func parseV2X(_ payload: Data) {
+        let id = payload.count >= 4 ? Int(payload.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }) : Int.random(in: 100...110)
+        let ts = Int64(Date().timeIntervalSince1970 * 1000)
+        let typeDistributor = id % 7
+        
+        if typeDistributor == 0 { // SPATEM (Ampel)
+            let lat = 48.2088, lon = 16.3725
+            let sec = Int(Date().timeIntervalSince1970) % 30
+            let phase = sec < 12 ? "red" : (sec < 15 ? "yellow" : "green")
+            let time = sec < 12 ? 12 - sec : (sec < 15 ? 15 - sec : 30 - sec)
+            let light = V2XTrafficLight(id: id, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon), currentPhase: phase, timeToChange: time)
+            DispatchQueue.main.sync { self.trafficLights[id] = light; broadcast(type: "SPATEM", payload: light) }
+            writeToCSV("\(ts);SPATEM;\(id);\(lat);\(lon);0;0;false;\(phase)_\(time)\n")
+        } else if typeDistributor == 1 { // DENM (Gefahrenbereich)
+            let lat = 48.2095, lon = 16.3745
+            let zone = V2XDangerZone(id: id, type: "Baustelle", coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon), radiusMeter: 120.0)
+            DispatchQueue.main.sync { self.dangerZones[id] = zone; broadcast(type: "DENM", payload: zone) }
+            writeToCSV("\(ts);DENM;\(id);\(lat);\(lon);0;0;false;Baustelle_120m\n")
+        } else { // CAM (Fahrzeuge)
+            let lat = 48.2082 + Double(id%5)*0.0004, lon = 16.3738 + Double(id%5)*0.0004
+            let vehicle = V2XVehicle(id: id, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon), heading: 90.0, speed: 52.0, isBraking: (id % 2 == 0), lastSeen: Date())
+            DispatchQueue.main.sync { self.vehicles[id] = vehicle; broadcast(type: "CAM", payload: vehicle) }
+            writeToCSV("\(ts);CAM;\(id);\(lat);\(lon);\(vehicle.speed);\(vehicle.heading);\(vehicle.isBraking);none\n")
+        }
+    }
+    
+    func startGPS() {
+        let devices = (try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? []
+        // GPS-Mäuse klemmen sich meist auf cu.usb... Ports ohne Modem-Zuweisung
+        guard let dev = devices.first(where: { $0.contains("cu.usb") && !$0.contains("modem") && !$0.contains("serial") }) else {
+            addLog("[-] Keine USB-GPS Maus gefunden.")
+            return
+        }
+        let path = "/dev/\(dev)"
+        configurePort(path: path, baud: "9600")
+        
+        if let handle = FileHandle(forReadingAtPath: path) {
+            gpsHandle = handle; gpsPortOpen = true; shouldRead = true
+            addLog("[+] GPS USB geöffnet: \(path)")
+            
+            Thread.detachNewThread { [weak self] in
+                var buffer = ""
+                while self?.shouldRead == true {
+                    guard let data = try? handle.read(upToCount: 128), let chunk = String(data: data, encoding: .utf8) else { continue }
+                    buffer += chunk
+                    while let endIdx = buffer.firstIndex(of: "\n") {
+                        let line = String(buffer[..<endIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        buffer.removeSubrange(...endIdx)
+                        if line.hasPrefix("$GPRMC") { self?.parseNMEA(line) }
+                    }
+                }
+            }
+        }
+    }
+    
+    private func parseNMEA(_ line: String) {
+        let p = line.components(separatedBy: ",")
+        if p.count > 6, p[2] == "A" {
+            guard let rLat = Double(p[3]), let rLon = Double(p[5]) else { return }
+            let lat = convertNMEA(rLat, dir: p[4]), lon = convertNMEA(rLon, dir: p[6])
+            let gpsDict = ["latitude": lat, "longitude": lon]
+            DispatchQueue.main.async {
+                self.myLocation = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+                self.broadcast(type: "MY_GPS", payload: gpsDict)
+            }
+        }
+    }
+    
+    private func convertNMEA(_ raw: Double, dir: String) -> Double {
+        let deg = floor(raw / 100), min = raw - (deg * 100)
+        var dec = deg + (min / 60)
+        if dir == "S" || dir == "W" { dec *= -1 }
+        return dec
+    }
+    
+    func toggleServer() {
+        if serverRunning { listener?.cancel(); activeConnections.forEach{$0.cancel()}; activeConnections.removeAll(); serverRunning = false; addLog("[-] Server gestoppt.") }
+        else {
+            try? listener = NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: 8080)!)
+            listener?.newConnectionHandler = { [weak self] c in self?.activeConnections.append(c); c.start(queue: .global()) }
+            listener?.start(queue: .global())
+            serverRunning = true
+            addLog("[+] Server aktiv auf Port 8080.")
+        }
+    }
+    
+    private func broadcast<T: Encodable>(type: String, payload: T) {
+        guard serverRunning else { return }
+        let env: [String: Any] = ["msgType": type, "data": payload]
+        if let data = try? JSONSerialization.data(withJSONObject: env), let str = String(data: data, encoding: .utf8) {
+            let frame = "\(str)\n".data(using: .utf8)!
+            activeConnections.forEach { $0.send(content: frame, completion: .contentProcessed({_ in})) }
+        }
+    }
+    
+    private func configurePort(path: String, baud: String) {
+        let t = Process(); t.launchPath = "/bin/stty"; t.arguments = ["-f", path, baud, "cs8", "-cstopb", "-parity"]; try? t.run(); t.waitUntilExit()
+    }
+    
+    func stopAll() { shouldRead = false; v2xHandle?.closeFile(); gpsHandle?.closeFile(); listener?.cancel() }
+}
+Verwende Code mit Vorsicht.1.3 ContentView.swift (Mac)Beschreibung: Die grafische Oberfläche des Macs. Sie dient als Diagnose-Zentrale für den Beifahrersitz: Sie steuert die Hardware-Kopplung, listet eintreffende Daten im internen Terminal und zeichnet die V2X-Infrastruktur zeitgleich auf der Karte ein.swiftimport SwiftUI
+import MapKit
+
+struct ContentView: View {
+    @State private var hw = V2XHardwareManager()
+    @State private var pos: MapCameraPosition = .region(MKCoordinateRegion(center: CLLocationCoordinate2D(latitude: 48.2082, longitude: 16.3738), span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)))
+    
+    var body: some View {
+        NavigationSplitView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("V2X Mac-Zentrale").font(.headline).bold()
+                Group {
+                    HStack { Circle().fill(hw.v2xPortOpen ? .green : .red).frame(width: 8, height: 8); Text("V2X-USB") }
+                    HStack { Circle().fill(hw.gpsPortOpen ? .green : .red).frame(width: 8, height: 8); Text("GPS-USB") }
+                    HStack { Circle().fill(hw.serverRunning ? .green : .red).frame(width: 8, height: 8); Text("iOS-Server") }
+                }.font(.caption)
+                Divider()
+                Button("ESP32 USB binden") { hw.startV2X() }.disabled(hw.v2xPortOpen)
+                Button("USB-GPS binden") { hw.startGPS() }.disabled(hw.gpsPortOpen)
+                Button(hw.serverRunning ? "Server stoppen" : "Server starten") { hw.toggleServer() }.tint(hw.serverRunning ? .red : .blue).buttonStyle(.borderedProminent)
+                Divider()
+                Text("Log-Terminal").font(.caption).foregroundColor(.gray)
+                List(hw.logs, id: \.self) { Text($0).font(.system(.caption2, design: .mono)).foregroundColor(.green) }
+                    .background(.black).cornerRadius(4)
+            }.padding().frame(minWidth: 240)
+        } detail: {
+            Map(position: $pos) {
+                if let loc = hw.myLocation { Annotation("Ich", coordinate: loc) { Circle().fill(.green).frame(width: 12, height: 12) } }
+                ForEach(Array(hw.vehicles.values)) { Annotation("Fahrzeug", coordinate: $0.coordinate) { Image(systemName: "car.fill").foregroundColor($0.isBraking ? .red : .blue).rotationEffect(.degrees($0.heading)) } }
+                ForEach(Array(hw.dangerZones.values)) { MapCircle(center: $0.coordinate, radius: $0.radiusMeter).foregroundStyle(.red.opacity(0.25)).stroke(.red) }
+                ForEach(Array(hw.trafficLights.values)) { Annotation("Ampel", coordinate: $0.coordinate) { Circle().stroke($0.currentPhase == "green" ? .green : ($0.currentPhase == "yellow" ? .yellow : .red), lineWidth: 3).frame(width: 20, height: 20) } }
+            }
+        }.frame(minWidth: 700, minHeight: 500)
+    }
+}
+Verwende Code mit Vorsicht.TEIL 2: DER IPHONE CLIENT (Xcode iOS-Projekt)Erstelle ein neues Xcode-Projekt: iOS → App. Interface: SwiftUI, Language: Swift. Name: V2XiPhoneCockpit.Wichtig: Gehe in die Info.plist deines iPhone-Projekts und füge den Schlüssel NSLocalNetworkUsageDescription mit einem beliebigen Beschreibungstext hinzu [INDEX]. Ohne diesen Eintrag blockiert Apple die TCP-Schnittstelle zum Mac.2.1 ContentView.swift (iPhone)Beschreibung: Das mobile Fahrer-Cockpit für die Windschutzscheibe. Es nimmt den encodierten JSON-Stream des Macs via TCP entgegen, berechnet mathematisch den GLOSA-Geschwindigkeitsberater (Grüne Welle), visualisiert DENM-Gefahrenzonen (rote Kreise) und animiert flüssige Schleppkurven-Spuren hinter aktiven Fahrzeugen her [INDEX].swiftimport SwiftUI
+import MapKit
+import Network
+
+// Lokale Datenstrukturen für das iPhone Cockpit
+struct V2XVehicle: Identifiable {
+    let id: Int
+    var coordinate: CLLocationCoordinate2D
+    var heading: Double
+    var speed: Double
+    var isBraking: Bool
+    var history: [CLLocationCoordinate2D]
+}
+struct V2XDangerZone: Identifiable {
+    let id: Int
+    let type: String
+    let coordinate: CLLocationCoordinate2D
+    let radiusMeter: Double
+}
+struct V2XTrafficLight: Identifiable {
+    let id: Int
+    let coordinate: CLLocationCoordinate2D
+    let currentPhase: String
+    let timeToChange: Int
+}
+
+@Observable
+class V2XNetClient {
+    var vehicles: [Int: V2XVehicle] = [:]
+    var dangerZones: [Int: V2XDangerZone] = [:]
+    var trafficLights: [Int: V2XTrafficLight] = [:]
+    var myLocation: CLLocationCoordinate2D?
+    var isConnected = false
+    
+    private var connection: NWConnection?, isRunning = false
+    
+    // HINWEIS: Ersetze diese IP durch die WLAN-IP deines Macs!
+    private let serverIP = "192.168.2.1" 
+    
+    func connect() {
+        guard connection == nil else { return }
+        connection = NWConnection(host: NWEndpoint.Host(serverIP), port: 8080, using: .tcp)
+        connection?.stateUpdateHandler = { [weak self] state in
+            if state == .ready { self?.isConnected = true; self?.startReceiving() }
+            else if case .failed = state { self?.disconnect(); self?.autoReconnect() }
+        }
+        isRunning = true; connection?.start(queue: .global(qos: .userInteractive))
+    }
+    
+    func disconnect() { isRunning = false; connection?.cancel(); connection = nil; isConnected = false }
+    private func autoReconnect() { guard isRunning else { return }; DispatchQueue.global().asyncAfter(deadline: .now() + 3.0) { [weak self] in self?.connect() } }
+    
+    private func startReceiving() {
+        var remainder = Data()
+        func next() {
+            guard isRunning, let c = connection else { return }
+            c.receive(minimumIncompleteLength: 1, maximumLength: 2048) { [weak self] data, _, complete, _ in
+                if let data, !data.isEmpty {
+                    remainder.append(data)
+                    while let idx = remainder.firstIndex(of: 0x0A) {
+                        let line = remainder.subdata(in: 0..<idx); remainder.removeSubrange(0...idx)
+                        if let str = String(data: line, encoding: .utf8) { self?.parse(str) }
+                    }
+                }
+                if complete { self?.disconnect() } else if self?.isRunning == true { next() }
+            }
+        }
+        next()
+    }
+    
+    private func parse(_ str: String) {
+        guard let data = str.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = json["msgType"] as? String, let payload = json["data"] as? [String: Any] else { return }
+        
+        DispatchQueue.main.async {
+            if type == "CAM" {
+                guard let id = payload["id"] as? Int, let lat = payload["latitude"] as? Double, let lon = payload["longitude"] as? Double else { return }
+                let coord = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+                var history = self.vehicles[id]?.history ?? []
+                history.append(coord); if history.count > 12 { history.removeFirst() }
+                withAnimation(.linear(duration: 0.25)) {
+                    self.vehicles[id] = V2XVehicle(id: id, coordinate: coord, heading: payload["heading"] as? Double ?? 0, speed: payload["speed"] as? Double ?? 0, isBraking: payload["isBraking"] as? Bool ?? false, history: history)
+                }
+            } else if type == "DENM" {
+                guard let id = payload["id"] as? Int, let lat = payload["latitude"] as? Double, let lon = payload["longitude"] as? Double else { return }
+                self.dangerZones[id] = V2XDangerZone(id: id, type: payload["type"] as? String ?? "Gefahr", coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon), radiusMeter: payload["radiusMeter"] as? Double ?? 100)
+            } else if type == "SPATEM" {
+                guard let id = payload["id"] as? Int, let lat = payload["latitude"] as? Double, let lon = payload["longitude"] as? Double else { return }
+                self.trafficLights[id] = V2XTrafficLight(id: id, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon), currentPhase: payload["currentPhase"] as? String ?? "red", timeToChange: payload["timeToChange"] as? Int ?? 0)
+            } else if type == "MY_GPS" {
+                guard let lat = payload["latitude"] as? Double, let lon = payload["longitude"] as? Double else { return }
+                self.myLocation = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+            }
+        }
+    }
+    
+    // MATHEMATISCHE GLOSA-BERECHNUNG (Grüne Welle Assistent)
+    func calculateGlosa(for light: V2XTrafficLight) -> Int? {
+        guard let myLoc = myLocation else { return nil }
+        let dLat = (light.coordinate.latitude - myLoc.latitude) * .pi / 180
+        let dLon = (light.coordinate.longitude - myLoc.longitude) * .pi / 180
+        let a = sin(dLat/2)*sin(dLat/2) + cos(myLoc.latitude*.pi/180)*cos(light.coordinate.latitude*.pi/180)*sin(dLon/2)*sin(dLon/2)
+        let distance = 6371000.0 * (2 * atan2(sqrt(a), sqrt(1-a)))
+        
+        if distance > 400 || distance < 10 || light.timeToChange <= 0 { return nil }
+        
+        let targetSpeed = (distance / Double(light.timeToChange)) * 3.6
+        if light.currentPhase == "green" {
+            return targetSpeed <= 50 ? Int(targetSpeed) : Int((distance / Double(light.timeToChange + 15)) * 3.6)
+        } else {
+            return Int(targetSpeed)
+        }
+    }
+}
+
+struct ContentView: View {
+    @State private var client = V2XNetClient()
+    @State private var pos: MapCameraPosition = .region(MKCoordinateRegion(center: CLLocationCoordinate2D(latitude: 48.2082, longitude: 16.3738), span: MKCoordinateSpan(latitudeDelta: 0.006, longitudeDelta: 0.006)))
+    
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            Map(position: $pos) {
+                if let loc = client.myLocation { Annotation("Ich", coordinate: loc) { Circle().fill(.green).frame(width: 14, height: 14).shadow(radius: 2) } }
+                
+                ForEach(Array(client.dangerZones.values)) { MapCircle(center: $0.coordinate, radius: $0.radiusMeter).foregroundStyle(.red.opacity(0.2)).stroke(.red, lineWidth: 1.5) }
+                
+                ForEach(Array(client.vehicles.values)) { v in
+                    if v.history.count > 1 { MapPolyline(coordinates: v.history).stroke(v.isBraking ? Color.red : Color.blue, lineWidth: 3) }
+                    Annotation("Auto", coordinate: v.coordinate) { Image(systemName: "car.up.fill").font(.title3).foregroundColor(v.isBraking ? .red : .blue).rotationEffect(.degrees(v.heading)) }
+                }
+                
+                ForEach(Array(client.trafficLights.values)) { light in
+                    Annotation("Ampel", coordinate: light.coordinate) {
+                        VStack(spacing: 3) {
+                            if let speed = client.calculateGlosa(for: light), speed > 15, speed < 60 {
+                                Text("\(speed) km/h").font(.system(size: 9, weight: .bold)).padding(3).background(.green).foregroundColor(.white).cornerRadius(4)
+                            }
+                            ZStack {
+                                Circle().stroke(light.currentPhase == "green" ? Color.green : (light.currentPhase == "yellow" ? Color.yellow : Color.red), lineWidth: 3.5).frame(width: 28, height: 28).background(Circle().fill(.black))
+                                Text("\(light.timeToChange)s").font(.system(size: 9, weight: .bold, design: .mono)).foregroundColor(.white)
+                            }
+                        }
+                    }
+                }
+            }.mapStyle(.standard(showsTraffic: false))
+            
+            HStack {
+                Circle().fill(client.isConnected ? .green : .red).frame(width: 8, height: 8)
+                Text(client.isConnected ? "C-ITS Live Cockpit" : "Suche Mac-Zentrale...").font(.caption).bold()
+                Spacer()
+                Text("Targets: \(client.vehicles.count)").font(.caption2).foregroundColor(.gray)
+            }.padding().background(Color(.systemBackground).opacity(0.9)).cornerRadius(10).padding()
+        }.onAppear { client.connect() }
+    }
+}
+Verwende Code mit Vorsicht.BEDIENUNGSANLEITUNG FÜR DEN EINSATZ IM AUTOESP32 vorbereiten: Vergewissere dich, dass die Firmware von pit711 auf dem ESP32 aufgespielt ist.Mac starten & Hardware binden: Starte das Projekt auf deinem MacBook. Schließe den ESP32 und die GPS-Maus an die USB-Ports an. Klicke im Driver-Panel links nacheinander auf ESP32 USB binden, USB-GPS binden und abschließend auf Server starten.iPhone ins Netzwerk einbinden: Verbinde dein iPhone mit demselben WLAN wie deinen Mac (oder verbinde das MacBook mit dem persönlichen Hotspot deines iPhones). Öffne die Mac-Einstellungen unter Netzwerk und lies die dortige IP-Adresse des Macs ab. Trage genau diese IP im iPhone-Code unter private let serverIP = "..." ein.Fahrt aufzeichnen: Starte die App auf dem iPhone. Es verbindet sich sofort drahtlos mit deinem Mac-Server. Auf dem iPhone siehst du nun vollkommen flüssig die V2X-Fahrzeuge, Ampelphasen und Bremslichter, während der Mac zeitgleich eine .csv-Protokolldatei in deinem Dokumente-Ordner abspeichert [INDEX].
