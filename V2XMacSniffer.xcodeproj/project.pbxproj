@@ -10,9 +10,22 @@
 		FA4704A12FC0830800EC6548 /* V2XMacSniffer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = V2XMacSniffer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		FAA489792FC6F78B0032D667 /* Exceptions for "V2XMacSniffer" folder in "V2XMacSniffer" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Fehler.txt,
+			);
+			target = FA4704A02FC0830800EC6548 /* V2XMacSniffer */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		FA4704A32FC0830800EC6548 /* V2XMacSniffer */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				FAA489792FC6F78B0032D667 /* Exceptions for "V2XMacSniffer" folder in "V2XMacSniffer" target */,
+			);
 			path = V2XMacSniffer;
 			sourceTree = "<group>";
 		};

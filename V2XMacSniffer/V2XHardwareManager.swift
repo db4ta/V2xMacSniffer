@@ -391,11 +391,12 @@ class V2XHardwareManager {
     func toggleV2XConnection() {
         if isV2XManuallyConnected {
             isV2XManuallyConnected = false
-            v2xPortOpen = false
             shouldRead = false
+            v2xPortOpen = false
             if v2xFd != -1 {
+                // Sanftes Stoppen: kurze Verzögerung, dann Port schließen
                 sendESPCommand("sniffer --stop")
-                Thread.sleep(forTimeInterval: 0.05)
+                Thread.sleep(forTimeInterval: 0.02)
                 close(v2xFd)
                 v2xFd = -1
             }
@@ -446,6 +447,8 @@ class V2XHardwareManager {
             
             while self.shouldRead {
                 let n = read(fd, &buf, buf.count)
+                if !self.shouldRead { break }
+                
                 if n > 0 {
                     // Zählererhöhung Thread-safe auf dem MainActor
                     DispatchQueue.main.async {
@@ -492,7 +495,6 @@ class V2XHardwareManager {
                     if err == EINTR {
                         continue
                     }
-                    // Wenn wir manuell trennen, ignorieren wir den POSIX bad descriptor Error lautlos
                     if !self.shouldRead {
                         break
                     }
@@ -618,9 +620,10 @@ class V2XHardwareManager {
     func toggleGPSConnection() {
         if isGPSManuallyConnected {
             isGPSManuallyConnected = false
-            gpsPortOpen = false
             shouldRead = false
+            gpsPortOpen = false
             if gpsFd != -1 {
+                Thread.sleep(forTimeInterval: 0.02)
                 close(gpsFd)
                 gpsFd = -1
             }
@@ -670,6 +673,8 @@ class V2XHardwareManager {
             
             while self.shouldRead {
                 let n = read(fd, &buf, buf.count)
+                if !self.shouldRead { break }
+                
                 if n > 0 {
                     DispatchQueue.main.async {
                         self.totalGPSBytesRx += n
@@ -750,8 +755,8 @@ class V2XHardwareManager {
         let llcHeader = Data([0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x89, 0x47])
         
         guard let llcRange = payload.range(of: llcHeader) else {
-            // WICHTIGSTE ÄNDERUNG: Rauschen/Konsolenlogs werden ab jetzt geräuschlos verworfen,
-            // anstatt gefälschte Fahrzeuge in Wien zu erzeugen!
+            // Rauschen/Konsolenlogs werden ab jetzt geräuschlos verworfen,
+            // anstatt gefälschte Fahrzeuge zu erzeugen
             return
         }
         
@@ -763,7 +768,9 @@ class V2XHardwareManager {
             return
         }
         
-        let nextHeader = geoData[4]
+        // KORREKTUR: Der Next-Header-Wert (NH) belegt die oberen 4 Bits (Bits 4–7) des ersten Bytes im Common Header (Index 4).
+        // Durch Verschiebung um 4 Bits nach rechts erhalten wir den echten Wert (1 = BTP-A, 2 = BTP-B).
+        let nextHeader = geoData[4] >> 4
         
         // GN_ADDR ist bei geoData[12..<20]. Die Station ID wird aus den letzten 4 Bytes extrahiert.
         let stationIDBytes = geoData.subdata(in: 16..<20)
@@ -1364,7 +1371,7 @@ class V2XHardwareManager {
     // --- DIREKTER RAW COMMAND CHANNEL ZUM HARDWARE-TESTING ---
     func sendRawCommand(_ command: String) {
         let fd = self.v2xFd
-        guard fd != -1 else {
+        guard shouldRead, fd != -1 else {
             addLog("[!] Fehler: V2X-Port ist nicht geöffnet.")
             return
         }
@@ -1382,7 +1389,7 @@ class V2XHardwareManager {
     
     private func sendESPCommand(_ command: String) {
         let fd = self.v2xFd
-        guard fd != -1 else { return }
+        guard shouldRead, fd != -1 else { return }
         let fullCmd = command + "\r\n"
         fullCmd.withCString { cStr in
             _ = write(fd, cStr, strlen(cStr))
@@ -1607,21 +1614,25 @@ class V2XHardwareManager {
         shouldRead = false
         isV2XManuallyConnected = false
         isGPSManuallyConnected = false
-        
+
+        // Kurze Wartezeit, damit Reader-Schleifen den Flagwechsel sehen
+        Thread.sleep(forTimeInterval: 0.02)
+
         if v2xFd != -1 {
             sendESPCommand("sniffer --stop")
-            Thread.sleep(forTimeInterval: 0.05)
+            Thread.sleep(forTimeInterval: 0.02)
             close(v2xFd)
             v2xFd = -1
         }
         if gpsFd != -1 {
+            Thread.sleep(forTimeInterval: 0.02)
             close(gpsFd)
             gpsFd = -1
         }
-        
+
         v2xPortOpen = false
         gpsPortOpen = false
-        
+
         listener?.cancel()
         webDebugListener?.cancel()
     }
