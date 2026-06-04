@@ -154,6 +154,31 @@ struct ContentView: View {
                     
                     Divider()
                     
+                    // --- FAHRZEUGSPUREN (TRAILS) STEUERUNG ---
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("FAHRZEUGSPUREN (TRAILS)").font(.caption).bold().foregroundColor(.gray)
+
+                        Toggle("Trails behalten (kein Auto-Prune)", isOn: $hw.keepVehiclesAsTrail)
+                            .font(.caption).bold()
+                            .toggleStyle(.checkbox)
+                            .help("Wenn aktiv, werden inaktive Fahrzeuge nicht automatisch nach 10s entfernt; ihre Spur bleibt erhalten.")
+
+                        HStack(spacing: 8) {
+                            Text("Max. Punkte pro Spur:")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Stepper(value: $hw.maxTrailPointsPerVehicle, in: 20...2000, step: 20) {
+                                Text("\(hw.maxTrailPointsPerVehicle)")
+                                    .font(.system(size: 11, design: .monospaced))
+                            }
+                            .disabled(!hw.keepVehiclesAsTrail)
+                            .help("Begrenzt die Anzahl der gespeicherten Trailpunkte pro Fahrzeug.")
+                        }
+                    }
+
+                    Divider()
+                    
                     // GPS Empfänger Steuerung
                     VStack(alignment: .leading, spacing: 4) {
                         Text("GPS-EMPFÄNGER (NMEA)").font(.caption).bold().foregroundColor(.gray)
@@ -841,3 +866,4 @@ struct ESPCommandInputView: View {
         }
     }
 }
+
