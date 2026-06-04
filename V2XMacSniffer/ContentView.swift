@@ -223,12 +223,13 @@ struct ContentView: View {
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 70)
                                 .disabled(hw.serverRunning)
+                            Spacer()
                             Stepper("", value: $hw.serverPort, in: 1024...65535)
                                 .labelsHidden()
                                 .disabled(hw.serverRunning)
                         }.font(.caption)
                         
-                        Toggle("Web-Debugger auf Port \((hw.serverPort + 1).description) active", isOn: $hw.isWebDebugServerEnabled)
+                        Toggle("Web-Debugger auf Port \((hw.serverPort + 1).description) aktiv", isOn: $hw.isWebDebugServerEnabled)
                             .font(.caption)
                             .disabled(hw.serverRunning)
                             .padding(.vertical, 2)
@@ -381,7 +382,7 @@ struct ContentView: View {
                     }
                     .padding(.vertical, 2)
                     
-                    // Behebt die Warnung im Haupt-Log-Terminal
+                    // Haupt-Log-Terminal
                     List(Array(hw.logs.enumerated()), id: \.offset) { _, log in
                         Text(displayText(log))
                             .font(.system(.caption2, design: .monospaced))
@@ -402,15 +403,11 @@ struct ContentView: View {
     
     // Liefert eine String-Darstellung für beliebige LogEntry-Objekte
     private func displayText(_ entry: LogEntry) -> String {
-        let m = Mirror(reflecting: entry)
-        if let child = m.children.first(where: { $0.label == "message" }), let value = child.value as? String { return value }
-        if let child = m.children.first(where: { $0.label == "text" }), let value = child.value as? String { return value }
-        if let desc = (entry as AnyObject) as? CustomStringConvertible { return desc.description }
-        return String(describing: entry)
+        return entry.text
     }
 }
 
-// --- NATIVE MAPKIT-SCHNITTSTELLE FÜR macOS (Ermöglicht MKTileOverlay Offline-Kacheln) ---
+// --- NATIVE MAPKIT-SCHNITTSTELLE FÜR macOS ---
 struct CITSMapView: NSViewRepresentable {
     let hw: V2XHardwareManager
     
@@ -420,7 +417,7 @@ struct CITSMapView: NSViewRepresentable {
         
         // Initialer Fokus auf Stuttgart / Winnenden
         let center = CLLocationCoordinate2D(latitude: 48.7955, longitude: 9.2292)
-        let region = MKCoordinateRegion(center: center, span: MKCoordinateSpan(latitudeDelta: 0.15, longitudeDelta: 0.15))
+        let region = MKCoordinateRegion(center: center, span: MKCoordinateSpan(latitudeDelta: 0.015, longitudeDelta: 0.015))
         mapView.setRegion(region, animated: false)
         
         return mapView
@@ -428,6 +425,7 @@ struct CITSMapView: NSViewRepresentable {
     
     func updateNSView(_ mapView: MKMapView, context: Context) {
         updateTileOverlay(mapView)
+        updateOverlays(mapView)
         updateAnnotations(mapView)
     }
     
@@ -443,10 +441,33 @@ struct CITSMapView: NSViewRepresentable {
             mapView.removeOverlays(overlays)
         }
     }
+
+    private func updateOverlays(_ mapView: MKMapView) {
+        // Redraw non-tile polylines cleanly
+        let existingPolylines = mapView.overlays.filter { $0 is MKPolyline && !($0 is CachedTileOverlay) }
+        mapView.removeOverlays(existingPolylines)
+        
+        // 1. MAPEM - Fahrspuren einzeichnen
+        for mapGeo in hw.mapGeometries.values {
+            guard mapGeo.laneCoordinates.count >= 2 else { continue }
+            let polyline = MKPolyline(coordinates: mapGeo.laneCoordinates, count: mapGeo.laneCoordinates.count)
+            polyline.title = "MAPEM_Polyline"
+            mapView.addOverlay(polyline, level: .aboveRoads)
+        }
+        
+        // 2. MCM - Fahrt-Trajektorien einzeichnen
+        for maneuver in hw.maneuvers.values {
+            guard maneuver.trajectoryPoints.count >= 2 else { continue }
+            let polyline = MKPolyline(coordinates: maneuver.trajectoryPoints, count: maneuver.trajectoryPoints.count)
+            polyline.title = "MCM_Polyline"
+            mapView.addOverlay(polyline, level: .aboveRoads)
+        }
+    }
     
     private func updateAnnotations(_ mapView: MKMapView) {
         let currentAnnotations = mapView.annotations
         
+        // Eigene GPS-Position
         if let myLoc = hw.myLocation {
             let myPinExists = currentAnnotations.contains { $0.title == "Ich" }
             if !myPinExists {
@@ -459,6 +480,7 @@ struct CITSMapView: NSViewRepresentable {
             }
         }
         
+        // CAM Fahrzeuge
         for vehicle in hw.vehicles.values {
             let vehicleTitle = "Fahrzeug #\(vehicle.id)"
             if let existing = currentAnnotations.first(where: { $0.title == vehicleTitle }) as? MKPointAnnotation {
@@ -471,6 +493,7 @@ struct CITSMapView: NSViewRepresentable {
             }
         }
         
+        // Aufräumen inaktiver CAM Fahrzeuge
         for annotation in currentAnnotations {
             guard let title = annotation.title ?? "", title.hasPrefix("Fahrzeug #") else { continue }
             let idString = title.replacingOccurrences(of: "Fahrzeug #", with: "")
@@ -479,6 +502,7 @@ struct CITSMapView: NSViewRepresentable {
             }
         }
         
+        // SPATEM Ampelanlagen
         for light in hw.trafficLights.values {
             let lightTitle = "Ampel #\(light.id)"
             if let existing = currentAnnotations.first(where: { $0.title == lightTitle }) as? MKPointAnnotation {
@@ -493,15 +517,123 @@ struct CITSMapView: NSViewRepresentable {
             }
         }
         
+        // DENM Gefahrenzonen
         for zone in hw.dangerZones.values {
             let zoneTitle = "Gefahr #\(zone.id)"
             if let existing = currentAnnotations.first(where: { $0.title == zoneTitle }) as? MKPointAnnotation {
                 existing.coordinate = zone.coordinate
+                existing.subtitle = zone.type
             } else {
                 let annotation = MKPointAnnotation()
                 annotation.coordinate = zone.coordinate
                 annotation.title = zoneTitle
                 annotation.subtitle = zone.type
+                mapView.addAnnotation(annotation)
+            }
+        }
+
+        // IVIM Digitale Straßenschilder
+        for sign in hw.virtualSigns.values {
+            let signTitle = "Schild #\(sign.id)"
+            if let existing = currentAnnotations.first(where: { $0.title == signTitle }) as? MKPointAnnotation {
+                existing.coordinate = sign.coordinate
+                existing.subtitle = "Tempolimit: \(sign.value) km/h"
+            } else {
+                let annotation = MKPointAnnotation()
+                annotation.coordinate = sign.coordinate
+                annotation.title = signTitle
+                annotation.subtitle = "Tempolimit: \(sign.value) km/h"
+                mapView.addAnnotation(annotation)
+            }
+        }
+
+        // CPM Radar/LiDAR-Fremdobjekte
+        for obj in hw.collectiveObjects.values {
+            let objTitle = "Objekt #\(obj.id)"
+            if let existing = currentAnnotations.first(where: { $0.title == objTitle }) as? MKPointAnnotation {
+                existing.coordinate = obj.coordinate
+                existing.subtitle = "\(obj.objectClass) | \(obj.sensorType)"
+            } else {
+                let annotation = MKPointAnnotation()
+                annotation.coordinate = obj.coordinate
+                annotation.title = objTitle
+                annotation.subtitle = "\(obj.objectClass) | \(obj.sensorType)"
+                mapView.addAnnotation(annotation)
+            }
+        }
+
+        // SRM Prioritätsanfragen
+        for req in hw.signalRequests.values {
+            let reqTitle = "SRM #\(req.id)"
+            if let existing = currentAnnotations.first(where: { $0.title == reqTitle }) as? MKPointAnnotation {
+                existing.coordinate = req.coordinate
+                existing.subtitle = "\(req.requesterType) -> Kreuzung \(req.targetIntersectionID)"
+            } else {
+                let annotation = MKPointAnnotation()
+                annotation.coordinate = req.coordinate
+                annotation.title = reqTitle
+                annotation.subtitle = "\(req.requesterType) -> Kreuzung \(req.targetIntersectionID)"
+                mapView.addAnnotation(annotation)
+            }
+        }
+
+        // SSM Bestätigungen
+        for status in hw.signalStatuses.values {
+            let statusTitle = "SSM #\(status.id)"
+            if let existing = currentAnnotations.first(where: { $0.title == statusTitle }) as? MKPointAnnotation {
+                existing.coordinate = status.coordinate
+                existing.subtitle = "Kreuzung \(status.intersectionID) -> \(status.priorityGranted ? "Gewährt" : "Abgelehnt")"
+            } else {
+                let annotation = MKPointAnnotation()
+                annotation.coordinate = status.coordinate
+                annotation.title = statusTitle
+                annotation.subtitle = "Kreuzung \(status.intersectionID) -> \(status.priorityGranted ? "Gewährt" : "Abgelehnt")"
+                mapView.addAnnotation(annotation)
+            }
+        }
+
+        // MAPEM Kreuzungszentren
+        for mapGeo in hw.mapGeometries.values {
+            let mapTitle = "MAPEM #\(mapGeo.id)"
+            if let existing = currentAnnotations.first(where: { $0.title == mapTitle }) as? MKPointAnnotation {
+                existing.coordinate = mapGeo.centerCoordinate
+                existing.subtitle = mapGeo.name
+            } else {
+                let annotation = MKPointAnnotation()
+                annotation.coordinate = mapGeo.centerCoordinate
+                annotation.title = mapTitle
+                annotation.subtitle = mapGeo.name
+                mapView.addAnnotation(annotation)
+            }
+        }
+
+        // MCM Manöver-Startpunkte
+        for maneuver in hw.maneuvers.values {
+            guard let startPoint = maneuver.trajectoryPoints.first else { continue }
+            let maneuverTitle = "Maneuver #\(maneuver.id)"
+            if let existing = currentAnnotations.first(where: { $0.title == maneuverTitle }) as? MKPointAnnotation {
+                existing.coordinate = startPoint
+                existing.subtitle = "Phase: \(maneuver.coordinationPhase)"
+            } else {
+                let annotation = MKPointAnnotation()
+                annotation.coordinate = startPoint
+                annotation.title = maneuverTitle
+                annotation.subtitle = "Phase: \(maneuver.coordinationPhase)"
+                mapView.addAnnotation(annotation)
+            }
+        }
+
+        // RTCMEM Referenzstationen
+        for rtk in hw.rtkCorrections.values {
+            let rtkTitle = "RTK-Basis #\(rtk.id)"
+            if let existing = currentAnnotations.first(where: { $0.title == rtkTitle }) as? MKPointAnnotation {
+                existing.coordinate = rtk.coordinate
+                existing.subtitle = "RTK: \(rtk.correctionStatus) (\(rtk.signalStrengthDBm)dBm)"
+            } else {
+                let annotation = MKPointAnnotation()
+                annotation.coordinate = rtk.coordinate
+                annotation.title = rtkTitle
+                annotation.subtitle = "RTK: \(rtk.correctionStatus) (\(rtk.signalStrengthDBm)dBm)"
                 mapView.addAnnotation(annotation)
             }
         }
@@ -521,6 +653,20 @@ struct CITSMapView: NSViewRepresentable {
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let tileOverlay = overlay as? MKTileOverlay {
                 return MKTileOverlayRenderer(tileOverlay: tileOverlay)
+            } else if let polyline = overlay as? MKPolyline {
+                let renderer = MKPolylineRenderer(polyline: polyline)
+                if polyline.title == "MAPEM_Polyline" {
+                    renderer.strokeColor = .lightGray
+                    renderer.lineWidth = 4.0
+                    renderer.lineDashPattern = [6, 4] // Gestrichelte Spurlinie
+                } else if polyline.title == "MCM_Polyline" {
+                    renderer.strokeColor = .systemYellow
+                    renderer.lineWidth = 3.0 // Gelber Pfad für Absprachen
+                } else {
+                    renderer.strokeColor = .systemBlue
+                    renderer.lineWidth = 2.0
+                }
+                return renderer
             }
             return MKOverlayRenderer(overlay: overlay)
         }
@@ -539,27 +685,48 @@ struct CITSMapView: NSViewRepresentable {
             guard let title = annotation.title ?? "" else { return view }
             
             if title == "Ich" {
-                view?.markerTintColor = .green
+                view?.markerTintColor = NSColor.green
                 view?.glyphImage = NSImage(systemSymbolName: "person.fill", accessibilityDescription: nil)
             } else if title.hasPrefix("Fahrzeug #") {
                 let idString = title.replacingOccurrences(of: "Fahrzeug #", with: "")
                 if let id = Int(idString), let vehicle = parent.hw.vehicles[id] {
-                    view?.markerTintColor = vehicle.isBraking ? .red : .blue
+                    view?.markerTintColor = vehicle.isBraking ? NSColor.red : NSColor.blue
                     view?.glyphImage = NSImage(systemSymbolName: "car.fill", accessibilityDescription: nil)
                 }
             } else if title.hasPrefix("Ampel #") {
                 let idString = title.replacingOccurrences(of: "Ampel #", with: "")
                 if let id = Int(idString), let light = parent.hw.trafficLights[id] {
                     switch light.currentPhase.lowercased() {
-                    case "green": view?.markerTintColor = .green
-                    case "yellow": view?.markerTintColor = .orange
-                    default: view?.markerTintColor = .red
+                    case "green": view?.markerTintColor = NSColor.green
+                    case "yellow": view?.markerTintColor = NSColor.orange
+                    default: view?.markerTintColor = NSColor.red
                     }
-                    view?.glyphImage = NSImage(systemSymbolName: "trafficlight.fill", accessibilityDescription: nil)
+                    view?.glyphImage = NSImage(systemSymbolName: "traffic.light.fill", accessibilityDescription: nil)
                 }
             } else if title.hasPrefix("Gefahr #") {
-                view?.markerTintColor = .orange
+                view?.markerTintColor = NSColor.orange
                 view?.glyphImage = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)
+            } else if title.hasPrefix("Schild #") {
+                view?.markerTintColor = NSColor.red
+                view?.glyphImage = NSImage(systemSymbolName: "speedometer", accessibilityDescription: nil)
+            } else if title.hasPrefix("Objekt #") {
+                view?.markerTintColor = NSColor.purple
+                view?.glyphImage = NSImage(systemSymbolName: "figure.walk", accessibilityDescription: nil)
+            } else if title.hasPrefix("SRM #") {
+                view?.markerTintColor = NSColor.cyan
+                view?.glyphImage = NSImage(systemSymbolName: "light.beacon.max.fill", accessibilityDescription: nil)
+            } else if title.hasPrefix("SSM #") {
+                view?.markerTintColor = NSColor.blue
+                view?.glyphImage = NSImage(systemSymbolName: "checkmark.shield.fill", accessibilityDescription: nil)
+            } else if title.hasPrefix("MAPEM #") {
+                view?.markerTintColor = NSColor.gray
+                view?.glyphImage = NSImage(systemSymbolName: "map.fill", accessibilityDescription: nil)
+            } else if title.hasPrefix("Maneuver #") {
+                view?.markerTintColor = NSColor.yellow
+                view?.glyphImage = NSImage(systemSymbolName: "point.topleft.down.to.point.bottomright.curvepath", accessibilityDescription: nil)
+            } else if title.hasPrefix("RTK-Basis #") {
+                view?.markerTintColor = NSColor.magenta
+                view?.glyphImage = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: nil)
             }
             
             return view
@@ -586,13 +753,25 @@ struct DebugConsoleView: View {
                     Text("\(hw.totalGPSBytesRx) B").font(.title3).bold().monospacedDigit()
                 }
                 Divider().frame(height: 35)
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text("DEKODIERTE C-ITS INFRASTRUKTUR-PAKETE").font(.system(size: 9)).foregroundColor(.gray)
-                    HStack(spacing: 12) {
-                        Text("CAM: \(hw.decodedCAMs)").foregroundColor(.blue).bold()
-                        Text("DENM: \(hw.decodedDENMs)").foregroundColor(.red).bold()
-                        Text("SPATEM: \(hw.decodedSPATEMs)").foregroundColor(.orange).bold()
-                    }.font(.caption)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 8) {
+                            Text("CAM: \(hw.decodedCAMs)").foregroundColor(.blue).bold()
+                            Text("DENM: \(hw.decodedDENMs)").foregroundColor(.red).bold()
+                            Text("SPATEM: \(hw.decodedSPATEMs)").foregroundColor(.orange).bold()
+                            Text("MAPEM: \(hw.decodedMAPEMs)").foregroundColor(.gray).bold()
+                            Text("IVIM: \(hw.decodedIVIMs)").foregroundColor(.red).bold()
+                        }
+                        HStack(spacing: 8) {
+                            Text("CPM: \(hw.decodedCPMs)").foregroundColor(.purple).bold()
+                            Text("SRM: \(hw.decodedSRMs)").foregroundColor(.cyan).bold()
+                            Text("SSM: \(hw.decodedSSMs)").foregroundColor(.blue).bold()
+                            Text("MCM: \(hw.decodedMCMs)").foregroundColor(.yellow).bold()
+                            Text("RTCMEM: \(hw.decodedRTCMEMs)").foregroundColor(Color(NSColor.magenta)).bold()
+                        }
+                    }
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
                 }
                 Spacer()
                 Button(action: { hw.resetDebugCounters() }) {
@@ -625,17 +804,48 @@ struct DebugConsoleView: View {
                 VStack(spacing: 0) {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("C-ITS SIGNAL-GENERATOR (HARDWARE-FREIE SIMULATION)").font(.caption).bold().foregroundColor(.secondary)
-                        HStack(spacing: 10) {
+                        
+                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                             Button(action: { hw.simulateCAM() }) {
-                                Label("CAM generieren", systemImage: "car.fill")
+                                Label("CAM (Car)", systemImage: "car.fill")
+                                    .frame(maxWidth: .infinity)
                             }
                             Button(action: { hw.simulateDENM() }) {
-                                Label("DENM generieren", systemImage: "exclamationmark.triangle.fill")
+                                Label("DENM (Hazard)", systemImage: "exclamationmark.triangle.fill")
+                                    .frame(maxWidth: .infinity)
                             }
                             Button(action: { hw.simulateSPATEM() }) {
-                                Label("SPATEM generieren", systemImage: "circle.fill")
+                                Label("SPATEM (LSA)", systemImage: "traffic.light.fill")
+                                    .frame(maxWidth: .infinity)
                             }
-                            Spacer()
+                            Button(action: { hw.simulateMAPEM() }) {
+                                Label("MAPEM (Lane)", systemImage: "map.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            Button(action: { hw.simulateIVIM() }) {
+                                Label("IVIM (Limit)", systemImage: "speedometer")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            Button(action: { hw.simulateCPM() }) {
+                                Label("CPM (Objects)", systemImage: "figure.walk")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            Button(action: { hw.simulateSRM() }) {
+                                Label("SRM (Priority Req)", systemImage: "light.beacon.max.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            Button(action: { hw.simulateSSM() }) {
+                                Label("SSM (Priority OK)", systemImage: "checkmark.shield.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            Button(action: { hw.simulateMCM() }) {
+                                Label("MCM (Cooperation)", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            Button(action: { hw.simulateRTCMEM() }) {
+                                Label("RTCMEM (RTK)", systemImage: "antenna.radiowaves.left.and.right")
+                                    .frame(maxWidth: .infinity)
+                            }
                         }
                     }
                     .padding()
@@ -832,11 +1042,7 @@ struct DebugConsoleView: View {
     }
     
     private func displayText(_ entry: LogEntry) -> String {
-        let m = Mirror(reflecting: entry)
-        if let child = m.children.first(where: { $0.label == "message" }), let value = child.value as? String { return value }
-        if let child = m.children.first(where: { $0.label == "text" }), let value = child.value as? String { return value }
-        if let desc = (entry as AnyObject) as? CustomStringConvertible { return desc.description }
-        return String(describing: entry)
+        return entry.text
     }
     
     private var v2xLogs: [LogEntry] { hw.debugRawPackets.filter { displayText($0).contains("[V2X]") } }
@@ -866,4 +1072,3 @@ struct ESPCommandInputView: View {
         }
     }
 }
-
