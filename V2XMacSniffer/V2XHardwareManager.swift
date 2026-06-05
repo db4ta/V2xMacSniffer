@@ -19,12 +19,82 @@ struct LogEntry: Identifiable, Codable, Equatable {
     }
 }
 
+// MARK: - JSON Netzwerk-Protokoll Hilfsmodelle (Auch auf macOS verfügbar)
+struct TCPMessageEnvelope: Codable {
+    let msgType: String
+    let data: TCPMessageData
+}
+
+struct TCPMessageData: Codable {
+    let id: Int
+    let latitude: Double?
+    let longitude: Double?
+    let coordinate: CoordinateHelper?
+    let speed: Double?
+    let speedKmH: Double?
+    let heading: Double?
+    let isBraking: Bool?
+    let currentPhase: String?
+    let timeToChange: Int?
+    let type: String? // Für Gefahrenzonen
+    let radiusMeter: Double?
+    
+    struct CoordinateHelper: Codable {
+        let latitude: Double
+        let longitude: Double
+    }
+}
+
 // MARK: - CachedTileOverlay für MapKit Offline-Caching Support
 class CachedTileOverlay: MKTileOverlay {
+    let cacheDirectory: URL
+    
+    override init(urlTemplate URLTemplate: String? = nil) {
+        let paths = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
+        self.cacheDirectory = paths[0].appendingPathComponent("MapTiles", isDirectory: true)
+        try? FileManager.default.createDirectory(at: self.cacheDirectory, withIntermediateDirectories: true)
+        super.init(urlTemplate: URLTemplate)
+    }
+    
+    func cachePath(for path: MKTileOverlayPath) -> URL {
+        return cacheDirectory
+            .appendingPathComponent("\(path.z)")
+            .appendingPathComponent("\(path.x)")
+            .appendingPathComponent("\(path.y).png")
+    }
+    
     override func url(forTilePath path: MKTileOverlayPath) -> URL {
         // Standard-Fallback auf OpenStreetMap
         let urlString = "https://a.tile.openstreetmap.org/\(path.z)/\(path.x)/\(path.y).png"
         return URL(string: urlString)!
+    }
+    
+    override func loadTile(at path: MKTileOverlayPath, result: @escaping (Data?, Error?) -> Void) {
+        let fileURL = cachePath(for: path)
+        
+        // 1. Lokalen Cache prüfen
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            if let data = try? Data(contentsOf: fileURL) {
+                result(data, nil)
+                return
+            }
+        }
+        
+        // 2. Online laden und für Offline-Einsatz wegspeichern
+        let tileURL = self.url(forTilePath: path)
+        var request = URLRequest(url: tileURL)
+        request.setValue("V2XMacSniffer/1.0 (macOS; V2X C-ITS Terminal App)", forHTTPHeaderField: "User-Agent")
+        
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let data = data {
+                let directory = fileURL.deletingLastPathComponent()
+                try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try? data.write(to: fileURL)
+                result(data, nil)
+            } else {
+                result(nil, error)
+            }
+        }.resume()
     }
 }
 
@@ -177,11 +247,7 @@ struct V2XSignalRequest: Identifiable, Codable, Equatable {
     enum CodingKeys: String, CodingKey { case id, requesterType, targetIntersectionID, requestStatus, latitude, longitude }
 
     init(id: Int, requesterType: String, targetIntersectionID: Int, requestStatus: String, coordinate: CLLocationCoordinate2D) {
-        self.id = id
-        self.requesterType = requesterType
-        self.targetIntersectionID = targetIntersectionID
-        self.requestStatus = requestStatus
-        self.coordinate = coordinate
+        self.id = id; self.requesterType = requesterType; self.targetIntersectionID = targetIntersectionID; self.requestStatus = requestStatus; self.coordinate = coordinate
     }
 
     init(from decoder: Decoder) throws {
@@ -222,11 +288,7 @@ struct V2XSignalStatus: Identifiable, Codable, Equatable {
     enum CodingKeys: String, CodingKey { case id, intersectionID, priorityGranted, activeRequesterID, latitude, longitude }
 
     init(id: Int, intersectionID: Int, priorityGranted: Bool, activeRequesterID: Int, coordinate: CLLocationCoordinate2D) {
-        self.id = id
-        self.intersectionID = intersectionID
-        self.priorityGranted = priorityGranted
-        self.activeRequesterID = activeRequesterID
-        self.coordinate = coordinate
+        self.id = id; self.intersectionID = intersectionID; self.priorityGranted = priorityGranted; self.activeRequesterID = activeRequesterID; self.coordinate = coordinate
     }
 
     init(from decoder: Decoder) throws {
@@ -383,10 +445,10 @@ class V2XHardwareManager {
     var isWebDebugServerEnabled = true
     var connectedClients: [String] = []
     
-    // Offline-Karten Cache-Eigenschaften
+    // Offline-Karten Cache-Eigenschaften (Auf Bundesländer umgestellt)
     var isOfflineMapActive = false
-    var selectedOfflineRegion = "Stuttgart"
-    let offlineRegionOptions = ["Stuttgart", "München", "Berlin", "Hamburg"]
+    var selectedOfflineRegion = "Baden-Württemberg"
+    let offlineRegionOptions = ["Baden-Württemberg", "Bayern", "Nordrhein-Westfalen", "Hessen"]
     var isDownloadingMap = false
     var downloadProgress: Double = 0.0
     var downloadedTilesCount = 0
@@ -541,171 +603,209 @@ class V2XHardwareManager {
     }
     
     private func parseV2X(_ payload: Data) {
-        // Sicherer Byte-Shift statt "withUnsafeBytes { $0.load(as: UInt32.self) }" zur Vermeidung von Alignment-Crashes
-        let id: Int
-        if payload.count >= 4 {
-            id = Int(payload[0]) << 24 | Int(payload[1]) << 16 | Int(payload[2]) << 8 | Int(payload[3])
-        } else {
-            id = Int.random(in: 100...110)
-        }
+        guard !payload.isEmpty else { return }
         
         let ts = Int64(Date().timeIntervalSince1970 * 1000)
-        let typeDistributor = id % 11
         
-        switch typeDistributor {
-        case 0: // SPATEM
-            decodedSPATEMs += 1
-            let lat = 48.7955 + Double.random(in: -0.001...0.001)
-            let lon = 9.2292 + Double.random(in: -0.001...0.001)
-            let sec = Int(Date().timeIntervalSince1970) % 30
-            let phase = sec < 12 ? "red" : (sec < 15 ? "yellow" : "green")
-            let time = sec < 12 ? 12 - sec : (sec < 15 ? 15 - sec : 30 - sec)
-            let light = V2XTrafficLight(id: id, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon), currentPhase: phase, timeToChange: time)
-            DispatchQueue.main.async {
-                self.trafficLights[id] = light
-                self.broadcast(type: "SPATEM", payload: light)
+        // --- 1. PROAKTIVER JSON-DEKODER (Falls die ESP32 Firmware JSON sendet) ---
+        if payload[0] == 0x7B { // '{' character
+            if let decodedStr = String(data: payload, encoding: .utf8) {
+                addDebugPacketLog("[V2X JSON] \(decodedStr)")
+                if let envelope = try? JSONDecoder().decode(TCPMessageEnvelope.self, from: payload) {
+                    processJSONEnvelope(envelope, payload: payload, ts: ts)
+                    return
+                }
             }
-            addDebugPacketLog("[V2X] SPATEM erhalten: Ampel #\(id) Phase \(phase) (\(time)s)")
-            logForensics(line: "\(ts);SPATEM;\(id);\(lat);\(lon);0;0;false;\(phase)_\(time)\n", rawPacket: payload)
+        }
+        
+        // --- 2. HOCHPERFORMANTER BINÄR-DEKODER (ETSI ITS-G5 SLIP Protokoll von pit711) ---
+        let typeByte = payload[0]
+        
+        // Endianness-sichere Hilfsfunktionen zur Extraktion von vorzeichenbehafteten Integern
+        func readInt32(offset: Int) -> Int32? {
+            guard payload.count >= offset + 4 else { return nil }
+            let valLE = payload.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
+            let valBE = valLE.byteSwapped
             
-        case 1: // DENM
+            // Plausibilitätsprüfung für geografische Koordinaten in Europa (ETSI mit 10^7 skaliert)
+            let degLE = Double(valLE) / 10_000_000.0
+            let degBE = Double(valBE) / 10_000_000.0
+            
+            // Europa Bounding Box (Breitengrad: 35 bis 72, Längengrad: -15 bis 42)
+            if degLE > 35.0 && degLE < 72.0 {
+                return valLE
+            } else if degBE > 35.0 && degBE < 72.0 {
+                return valBE
+            }
+            return valLE
+        }
+        
+        func readUInt32(offset: Int) -> UInt32? {
+            guard payload.count >= offset + 4 else { return nil }
+            return payload.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+        }
+        
+        func readUInt16(offset: Int) -> UInt16? {
+            guard payload.count >= offset + 2 else { return nil }
+            return payload.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self) }
+        }
+        
+        // Sichern der Mindest-Paketlänge für die Basisdaten (Typ [1B] + ID [4B] + Lat [4B] + Lon [4B] = 13 Bytes)
+        guard payload.count >= 13,
+              let stationIDVal = readUInt32(offset: 1),
+              let rawLat = readInt32(offset: 5),
+              let rawLon = readInt32(offset: 9) else {
+            return
+        }
+        
+        let id = Int(stationIDVal)
+        let lat = Double(rawLat) / 10_000_000.0
+        let lon = Double(rawLon) / 10_000_000.0
+        let coordinate = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+        
+        // Schutz vor fehlerhaften Null-Auslesungen
+        guard lat != 0.0 && lon != 0.0 else { return }
+        
+        switch typeByte {
+        case 1, 0x43: // CAM (1 oder 'C')
+            decodedCAMs += 1
+            
+            let rawHeading = readUInt16(offset: 13) ?? 0
+            let rawSpeed = readUInt16(offset: 15) ?? 0
+            let brakeByte = payload.count >= 18 ? payload[17] : 0
+            
+            // ETSI CAM heading ist in 0.1 Grad (0..3600)
+            let heading = Double(rawHeading) / 10.0
+            
+            // ETSI CAM speed ist in 0.01 m/s (z.B. 1389 -> 13.89 m/s = 50 km/h)
+            let speedMS = Double(rawSpeed) / 100.0
+            let speedKMH = speedMS * 3.6
+            let isBraking = brakeByte != 0
+            
+            DispatchQueue.main.async {
+                var vehicle = self.vehicles[id] ?? V2XVehicle(id: id, coordinate: coordinate, heading: heading, speed: speedKMH, isBraking: isBraking, lastSeen: Date())
+                vehicle.updatePosition(to: coordinate, heading: heading, speed: speedKMH, isBraking: isBraking)
+                self.vehicles[id] = vehicle
+                self.broadcast(type: "CAM", payload: vehicle)
+            }
+            
+            addDebugPacketLog("[V2X CAM] Auto #\(id): Lat \(lat), Lon \(lon), Speed: \(String(format: "%.1f", speedKMH)) km/h, Heading: \(Int(heading))°")
+            logForensics(line: "\(ts);CAM;\(id);\(lat);\(lon);\(speedKMH);\(heading);\(isBraking);none\n", rawPacket: payload)
+            
+        case 2, 0x44: // DENM (2 oder 'D')
             decodedDENMs += 1
-            let lat = 48.7960 + Double.random(in: -0.001...0.001)
-            let lon = 9.2300 + Double.random(in: -0.001...0.001)
-            let zone = V2XDangerZone(id: id, type: "Baustelle", coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon), radiusMeter: 120.0)
+            
+            let causeCode = payload.count >= 14 ? payload[13] : 3 // Standardmäßig: Baustelle
+            let rawRadius = payload.count >= 16 ? readUInt16(offset: 14) ?? 150 : 150
+            
+            let type: String
+            switch causeCode {
+            case 1: type = "Stau"
+            case 2: type = "Unfall"
+            case 3: type = "Baustelle"
+            case 91: type = "Gefahr"
+            default: type = "Baustelle"
+            }
+            
+            let radius = Double(rawRadius)
+            let zone = V2XDangerZone(id: id, type: type, coordinate: coordinate, radiusMeter: radius)
+            
             DispatchQueue.main.async {
                 self.dangerZones[id] = zone
                 self.broadcast(type: "DENM", payload: zone)
             }
-            addDebugPacketLog("[V2X] DENM erhalten: Gefahr #\(id) - Baustelle")
-            logForensics(line: "\(ts);DENM;\(id);\(lat);\(lon);0;0;false;Baustelle_120m\n", rawPacket: payload)
             
-        case 2: // MAPEM
-            decodedMAPEMs += 1
-            let centerLat = 48.7955 + Double.random(in: -0.0005...0.0005)
-            let centerLon = 9.2292 + Double.random(in: -0.0005...0.0005)
-            let mapGeo = V2XMapGeometry(
-                id: id,
-                name: "Kreuzung_\(id)",
-                centerCoordinate: CLLocationCoordinate2D(latitude: centerLat, longitude: centerLon),
-                laneCoordinates: [
-                    CLLocationCoordinate2D(latitude: centerLat - 0.0003, longitude: centerLon - 0.0003),
-                    CLLocationCoordinate2D(latitude: centerLat, longitude: centerLon),
-                    CLLocationCoordinate2D(latitude: centerLat + 0.0003, longitude: centerLon + 0.0003)
-                ]
-            )
-            DispatchQueue.main.async {
-                self.mapGeometries[id] = mapGeo
-                self.broadcast(type: "MAPEM", payload: mapGeo)
+            addDebugPacketLog("[V2X DENM] Gefahr #\(id): Typ \(type) bei Lat \(lat), Lon \(lon), Radius: \(radius)m")
+            logForensics(line: "\(ts);DENM;\(id);\(lat);\(lon);0;0;false;\(type)_\(radius)m\n", rawPacket: payload)
+            
+        case 3, 0x53: // SPATEM (3 oder 'S')
+            decodedSPATEMs += 1
+            
+            let phaseByte = payload.count >= 14 ? payload[13] : 3
+            let rawTime = payload.count >= 16 ? readUInt16(offset: 14) ?? 100 : 100
+            
+            // Standard ETSI SPATEM Phasenmapping (red/yellow/green)
+            let phase: String
+            switch phaseByte {
+            case 2, 3: phase = "red"
+            case 4, 5: phase = "yellow"
+            case 6, 7: phase = "green"
+            default: phase = "red"
             }
-            addDebugPacketLog("[V2X] MAPEM erhalten: Kreuzungsgeometrie #\(id) mit Spuren")
-            logForensics(line: "\(ts);MAPEM;\(id);\(centerLat);\(centerLon);0;0;false;Intersection_\(id)\n", rawPacket: payload)
             
-        case 3: // IVIM
-            decodedIVIMs += 1
-            let lat = 48.7940 + Double.random(in: -0.001...0.001)
-            let lon = 9.2275 + Double.random(in: -0.001...0.001)
-            let speedLimit = [30, 50, 60, 80, 100].randomElement() ?? 50
-            let sign = V2XVirtualSign(id: id, type: "SPEED_LIMIT", value: speedLimit, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon))
-            DispatchQueue.main.async {
-                self.virtualSigns[id] = sign
-                self.broadcast(type: "IVIM", payload: sign)
-            }
-            addDebugPacketLog("[V2X] IVIM erhalten: Dynamisches Schild #\(id) Limit \(speedLimit) km/h")
-            logForensics(line: "\(ts);IVIM;\(id);\(lat);\(lon);0;0;false;Limit_\(speedLimit)\n", rawPacket: payload)
+            // Zeit bis Phasenwechsel in Sekunden (übertragen in Zehntelsekunden)
+            let timeToChange = Int(rawTime) / 10
             
-        case 4: // CPM
-            decodedCPMs += 1
-            let lat = 48.7958 + Double.random(in: -0.0008...0.0008)
-            let lon = 9.2298 + Double.random(in: -0.0008...0.0008)
-            let objectClass = ["PEDESTRIAN", "CYCLIST", "OBSTACLE"].randomElement() ?? "PEDESTRIAN"
-            let obj = V2XCollectiveObject(id: id, sensorType: "LIDAR", objectClass: objectClass, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon), speed: 4.5, heading: 180.0)
-            DispatchQueue.main.async {
-                self.collectiveObjects[id] = obj
-                self.broadcast(type: "CPM", payload: obj)
-            }
-            addDebugPacketLog("[V2X] CPM erhalten: Sensor-Fremdobjekt #\(id) \(objectClass)")
-            logForensics(line: "\(ts);CPM;\(id);\(lat);\(lon);4.5;180.0;false;Class_\(objectClass)\n", rawPacket: payload)
-            
-        case 5: // SRM
-            decodedSRMs += 1
-            let lat = 48.7945 + Double.random(in: -0.001...0.001)
-            let lon = 9.2285 + Double.random(in: -0.001...0.001)
-            let targetIntersection = Int.random(in: 1000...9999)
-            let req = V2XSignalRequest(id: id, requesterType: "FIRE_BRIGADE", targetIntersectionID: targetIntersection, requestStatus: "ACTIVE", coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon))
-            DispatchQueue.main.async {
-                self.signalRequests[id] = req
-                self.broadcast(type: "SRM", payload: req)
-            }
-            addDebugPacketLog("[V2X] SRM erhalten: Prioritätsanforderung #\(id) Feuerwehr an Ampel #\(targetIntersection)")
-            logForensics(line: "\(ts);SRM;\(id);\(lat);\(lon);0;0;false;PriorityRequest_Int\(targetIntersection)\n", rawPacket: payload)
-            
-        case 6: // SSM
-            decodedSSMs += 1
-            let lat = 48.7955 + Double.random(in: -0.001...0.001)
-            let lon = 9.2292 + Double.random(in: -0.001...0.001)
-            let requester = Int.random(in: 100...999)
-            let status = V2XSignalStatus(id: id, intersectionID: id * 2, priorityGranted: true, activeRequesterID: requester, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon))
-            DispatchQueue.main.async {
-                self.signalStatuses[id] = status
-                self.broadcast(type: "SSM", payload: status)
-            }
-            addDebugPacketLog("[V2X] SSM erhalten: Ampelbestätigung #\(id) für Einsatzfahrzeug #\(requester)")
-            logForensics(line: "\(ts);SSM;\(id);\(lat);\(lon);0;0;false;Granted_\(requester)\n", rawPacket: payload)
-            
-        case 7: // MCM
-            decodedMCMs += 1
-            let lat = 48.7950 + Double.random(in: -0.0005...0.0005)
-            let lon = 9.2280 + Double.random(in: -0.0005...0.0005)
-            let maneuver = V2XManeuver(
-                id: id,
-                vehicleID: id * 3,
-                coordinationPhase: "EXECUTING",
-                trajectoryPoints: [
-                    CLLocationCoordinate2D(latitude: lat, longitude: lon),
-                    CLLocationCoordinate2D(latitude: lat + 0.0002, longitude: lon + 0.0001),
-                    CLLocationCoordinate2D(latitude: lat + 0.0004, longitude: lon + 0.0002)
-                ]
-            )
-            DispatchQueue.main.async {
-                self.maneuvers[id] = maneuver
-                self.broadcast(type: "MCM", payload: maneuver)
-            }
-            addDebugPacketLog("[V2X] MCM erhalten: Trajektorienkoordination #\(id) Phase EXECUTING")
-            logForensics(line: "\(ts);MCM;\(id);\(lat);\(lon);0;0;false;Maneuver_Coord\n", rawPacket: payload)
-            
-        case 8: // RTCMEM
-            decodedRTCMEMs += 1
-            let lat = 48.7951
-            let lon = 9.2289
-            let baseStation = Int.random(in: 1...50)
-            let rtk = V2XRTKCorrection(id: id, baseStationID: baseStation, signalStrengthDBm: -68, correctionStatus: "RTK_FIX", coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon))
-            DispatchQueue.main.async {
-                self.rtkCorrections[id] = rtk
-                self.broadcast(type: "RTCMEM", payload: rtk)
-            }
-            addDebugPacketLog("[V2X] RTCMEM erhalten: RTK-GPS-Korrektur #\(id) von Basis #\(baseStation) - Status RTK_FIX")
-            logForensics(line: "\(ts);RTCMEM;\(id);\(lat);\(lon);0;0;false;RTK_FIX_Station_\(baseStation)\n", rawPacket: payload)
-            
-        default: // CAM
-            decodedCAMs += 1
-            let lat = 48.7950 + Double(id % 5) * 0.0004
-            let lon = 9.2280 + Double(id % 5) * 0.0004
-            let heading = 90.0
-            let speed = 52.0
-            let braking = (id % 2 == 0)
+            let light = V2XTrafficLight(id: id, coordinate: coordinate, currentPhase: phase, timeToChange: timeToChange)
             
             DispatchQueue.main.async {
-                var vehicle = self.vehicles[id] ?? V2XVehicle(id: id, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon), heading: heading, speed: speed, isBraking: braking, lastSeen: Date())
-                vehicle.updatePosition(to: CLLocationCoordinate2D(latitude: lat, longitude: lon), heading: heading, speed: speed, isBraking: braking)
-                self.vehicles[id] = vehicle
-                self.broadcast(type: "CAM", payload: vehicle)
+                self.trafficLights[id] = light
+                self.broadcast(type: "SPATEM", payload: light)
             }
-            addDebugPacketLog("[V2X] CAM erhalten: Auto #\(id) v=\(speed) km/h braking=\(braking)")
-            logForensics(line: "\(ts);CAM;\(id);\(lat);\(lon);\(speed);\(heading);\(braking);none\n", rawPacket: payload)
+            
+            addDebugPacketLog("[V2X SPATEM] Ampel #\(id): Phase \(phase.uppercased()) Countdown: \(timeToChange)s")
+            logForensics(line: "\(ts);SPATEM;\(id);\(lat);\(lon);0;0;false;\(phase)_\(timeToChange)\n", rawPacket: payload)
+            
+        default:
+            addDebugPacketLog("[V2X] Unbekanntes Binärpaket Typ \(typeByte) von ID \(id)")
         }
     }
     
+    // MARK: - JSON Envelope Parser (für Gateway-Kompatibilität)
+    private func processJSONEnvelope(_ envelope: TCPMessageEnvelope, payload: Data, ts: Int64) {
+        let p = envelope.data
+        let id = p.id
+        let lat = p.coordinate?.latitude ?? p.latitude ?? 0.0
+        let lon = p.coordinate?.longitude ?? p.longitude ?? 0.0
+        let coordinate = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+        
+        guard lat != 0.0 && lon != 0.0 else { return }
+        
+        switch envelope.msgType.uppercased() {
+        case "CAM":
+            self.decodedCAMs += 1
+            let speed = p.speedKmH ?? p.speed ?? 0.0
+            let heading = p.heading ?? 0.0
+            let braking = p.isBraking ?? false
+            
+            DispatchQueue.main.async {
+                var vehicle = self.vehicles[id] ?? V2XVehicle(id: id, coordinate: coordinate, heading: heading, speed: speed, isBraking: braking, lastSeen: Date())
+                vehicle.updatePosition(to: coordinate, heading: heading, speed: speed, isBraking: braking)
+                self.vehicles[id] = vehicle
+                self.broadcast(type: "CAM", payload: vehicle)
+            }
+            logForensics(line: "\(ts);CAM;\(id);\(lat);\(lon);\(speed);\(heading);\(braking);none\n", rawPacket: payload)
+            
+        case "DENM":
+            self.decodedDENMs += 1
+            let type = p.type ?? "Baustelle"
+            let radius = p.radiusMeter ?? 150.0
+            let zone = V2XDangerZone(id: id, type: type, coordinate: coordinate, radiusMeter: radius)
+            
+            DispatchQueue.main.async {
+                self.dangerZones[id] = zone
+                self.broadcast(type: "DENM", payload: zone)
+            }
+            logForensics(line: "\(ts);DENM;\(id);\(lat);\(lon);0;0;false;\(type)_\(radius)m\n", rawPacket: payload)
+            
+        case "SPATEM":
+            self.decodedSPATEMs += 1
+            let phase = p.currentPhase ?? "red"
+            let time = p.timeToChange ?? 10
+            let light = V2XTrafficLight(id: id, coordinate: coordinate, currentPhase: phase, timeToChange: time)
+            
+            DispatchQueue.main.async {
+                self.trafficLights[id] = light
+                self.broadcast(type: "SPATEM", payload: light)
+            }
+            logForensics(line: "\(ts);SPATEM;\(id);\(lat);\(lon);0;0;false;\(phase)_\(time)\n", rawPacket: payload)
+            
+        default:
+            break
+        }
+    }
+    
+    // MARK: - Forensik Hilfskonstrukte für Logging
     private func logForensics(line: String, rawPacket: Data) {
         if isCSVLoggingActive {
             let url = URL(fileURLWithPath: csvFilePathString)
@@ -1121,27 +1221,115 @@ class V2XHardwareManager {
         }
     }
     
-    // MARK: - Offline-Karten Downloads (Simuliert)
+    // MARK: - Echt-Funktionale Offline-Karten Downloads (Slippy Map Tile Downloader)
     func startOfflineMapDownload() {
         isDownloadingMap = true
         downloadProgress = 0.0
         downloadedTilesCount = 0
-        totalTilesToDownload = 150
+        totalTilesToDownload = 0
         
-        downloadTask = Task {
-            for i in 1...150 {
-                if Task.isCancelled { break }
-                try? await Task.sleep(nanoseconds: 30_000_000) // 30ms pro Kachel
-                await MainActor.run {
-                    self.downloadedTilesCount = i
-                    self.downloadProgress = Double(i) / 150.0
+        let minLat: Double
+        let maxLat: Double
+        let minLon: Double
+        let maxLon: Double
+        
+        // Geografische Bounding-Boxen der ausgewählten Bundesländer festlegen
+        switch selectedOfflineRegion {
+        case "Baden-Württemberg":
+            minLat = 47.50; maxLat = 49.80; minLon = 7.50; maxLon = 10.50
+        case "Bayern":
+            minLat = 47.20; maxLat = 50.60; minLon = 8.90; maxLon = 13.90
+        case "Nordrhein-Westfalen":
+            minLat = 50.30; maxLat = 52.55; minLon = 5.80; maxLon = 9.50
+        case "Hessen":
+            minLat = 49.39; maxLat = 51.65; minLon = 7.77; maxLon = 10.25
+        default:
+            minLat = 47.50; maxLat = 49.80; minLon = 7.50; maxLon = 10.50
+        }
+        
+        // Bietet Offline-Übersicht und Detailierung auf Landstraßenebene (Zoomstufe 10 bis 13)
+        let zoomLevels = [10, 11, 12, 13]
+        var tilesToDownload: [(z: Int, x: Int, y: Int)] = []
+        
+        for z in zoomLevels {
+            let xMin = tileX(longitude: minLon, zoom: z)
+            let xMax = tileX(longitude: maxLon, zoom: z)
+            let yMin = tileY(latitude: maxLat, zoom: z)
+            let yMax = tileY(latitude: minLat, zoom: z)
+            
+            for x in min(xMin, xMax)...max(xMin, xMax) {
+                for y in min(yMin, yMax)...max(yMin, yMax) {
+                    tilesToDownload.append((z, x, y))
                 }
             }
+        }
+        
+        totalTilesToDownload = tilesToDownload.count
+        guard totalTilesToDownload > 0 else {
+            isDownloadingMap = false
+            return
+        }
+        
+        let tempOverlay = CachedTileOverlay()
+        
+        downloadTask = Task {
+            var completed = 0
+            let session = URLSession.shared
+            
+            for tile in tilesToDownload {
+                if Task.isCancelled { break }
+                
+                let tilePath = MKTileOverlayPath(x: tile.x, y: tile.y, z: tile.z, contentScaleFactor: 1.0)
+                let localURL = tempOverlay.cachePath(for: tilePath)
+                
+                // Bereits heruntergeladene Kacheln überspringen
+                if FileManager.default.fileExists(atPath: localURL.path) {
+                    completed += 1
+                    await MainActor.run {
+                        self.downloadedTilesCount = completed
+                        self.downloadProgress = Double(completed) / Double(self.totalTilesToDownload)
+                    }
+                    continue
+                }
+                
+                let remoteURL = tempOverlay.url(forTilePath: tilePath)
+                var request = URLRequest(url: remoteURL)
+                request.setValue("V2XMacSniffer/1.0 (macOS; V2X C-ITS Terminal App)", forHTTPHeaderField: "User-Agent")
+                
+                do {
+                    let (data, response) = try await session.data(for: request)
+                    if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                        try FileManager.default.createDirectory(at: localURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        try data.write(to: localURL)
+                    }
+                    // Kurze Pause, um OSM-Dienste nicht zu überlasten (Politeness Delay)
+                    try? await Task.sleep(nanoseconds: 30_000_000)
+                } catch {
+                    self.addLog("[-] Kacheldownload-Fehler (Z:\(tile.z) X:\(tile.x) Y:\(tile.y)): \(error.localizedDescription)")
+                }
+                
+                completed += 1
+                await MainActor.run {
+                    self.downloadedTilesCount = completed
+                    self.downloadProgress = Double(completed) / Double(self.totalTilesToDownload)
+                }
+            }
+            
             await MainActor.run {
                 self.isDownloadingMap = false
                 self.addLog("[+] Offline-Karten-Download abgeschlossen (\(selectedOfflineRegion)).")
             }
         }
+    }
+    
+    // Hilfsfunktionen für Mercator-Projektion zu Slippy-Map Tile Koordinaten
+    private func tileX(longitude: Double, zoom: Int) -> Int {
+        return Int(floor((longitude + 180.0) / 360.0 * pow(2.0, Double(zoom))))
+    }
+    
+    private func tileY(latitude: Double, zoom: Int) -> Int {
+        let latRad = latitude * .pi / 180.0
+        return Int(floor((1.0 - log(tan(latRad) + (1.0 / cos(latRad))) / .pi) / 2.0 * pow(2.0, Double(zoom))))
     }
     
     func cancelOfflineMapDownload() {

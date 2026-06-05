@@ -1,5 +1,31 @@
 import SwiftUI
 import MapKit
+import AppKit
+
+// MARK: - ERWEITERTES C-ITS DATENMODELL
+enum V2XMessageType: String, Codable, CaseIterable {
+    case CAM = "CAM"
+    case DENM = "DENM"
+    case SPATEM = "SPATEM"
+    case MAPEM = "MAPEM"
+    case IVIM = "IVIM"
+    case CPM = "CPM"
+}
+
+struct V2XPacket: Identifiable, Equatable {
+    let id = UUID()
+    let stationID: UInt32
+    let messageType: V2XMessageType
+    let timestamp: Date
+    let coordinates: CLLocationCoordinate2D
+    let rawHex: String
+    let fullJsonString: String
+    let specificPayload: [String: Any]
+
+    static func == (lhs: V2XPacket, rhs: V2XPacket) -> Bool {
+        return lhs.id == rhs.id
+    }
+}
 
 // Dedizierter Formatter für Ports, der jegliche Tausendertrennung (Gruppierung) unterdrückt
 private let portFormatter: NumberFormatter = {
@@ -23,6 +49,12 @@ struct ContentView: View {
     private var gpsIsOpen: Bool { hw.gpsPortOpen }
     private var gpsIsManuallyConnected: Bool { hw.isGPSManuallyConnected }
     
+    // Live-Feed der neu strukturierten tshark V2X Pakete
+    @State private var livePackets: [V2XPacket] = []
+    @State private var selectedPacket: V2XPacket? = nil
+    @State private var lastIncomingCoordinate: CLLocationCoordinate2D? = nil
+    @State private var isShowingDetailPopover = false
+    
     var body: some View {
         // Lokale Bindable-Deklaration für fehlerfreie SwiftUI-Bindings
         @Bindable var hw = hw
@@ -40,6 +72,19 @@ struct ContentView: View {
                         .buttonStyle(.plain)
                         .help("Ports scannen")
                     }
+                    
+                    // Live Test-Generator zur Simulation von echtem tshark-Datenfluss
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("TSHARK LIVE-SIMULATOR").font(.caption2).bold().foregroundColor(.secondary)
+                        Button(action: simulateIncomingTsharkJSON) {
+                            Label("tshark JSON einspeisen", systemImage: "bolt.horizontal.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.purple)
+                    }
+                    
+                    Divider()
                     
                     // Status-Leuchtdioden
                     Group {
@@ -395,8 +440,18 @@ struct ContentView: View {
             }
             .frame(minWidth: 260, maxWidth: 350)
         } detail: {
-            CITSMapView(hw: hw)
+            ZStack {
+                CITSMapView(
+                    hw: hw,
+                    livePackets: livePackets,
+                    selectedPacket: $selectedPacket,
+                    lastIncomingCoordinate: $lastIncomingCoordinate
+                )
                 .edgesIgnoringSafeArea(.all)
+            }
+            .popover(item: $selectedPacket) { packet in
+                PacketDetailPopover(packet: packet)
+            }
         }
         .frame(minWidth: 960, minHeight: 600)
     }
@@ -405,11 +460,212 @@ struct ContentView: View {
     private func displayText(_ entry: LogEntry) -> String {
         return entry.text
     }
+    
+    // Simuliert den asynchronen tshark JSON Parser-Prozess im Hintergrund
+    private func simulateIncomingTsharkJSON() {
+        let types: [V2XMessageType] = [.CAM, .DENM, .SPATEM, .MAPEM, .IVIM, .CPM]
+        let selectedType = types.randomElement() ?? .CAM
+        
+        let randomStationID = UInt32.random(in: 1000...9999)
+        let stuttgartCenter = CLLocationCoordinate2D(latitude: 48.7955, longitude: 9.2292)
+        let packetCoordinate = CLLocationCoordinate2D(
+            latitude: stuttgartCenter.latitude + Double.random(in: -0.005...0.005),
+            longitude: stuttgartCenter.longitude + Double.random(in: -0.005...0.005)
+        )
+        
+        // Simulierter originaler tshark JSON-Output
+        let mockJSON = """
+        {
+          "timestamp": "\(ISO8601DateFormatter().string(from: Date()))",
+          "stationID": \(randomStationID),
+          "messageType": "\(selectedType.rawValue)",
+          "coordinates": {
+            "latitude": \(packetCoordinate.latitude),
+            "longitude": \(packetCoordinate.longitude)
+          },
+          "rawHex": "00C0DECAFE\(String(randomStationID, radix: 16).uppercased())",
+          "protocol": "ETSI C-ITS V2X Over ITS-G5",
+          "details": {
+            "speed": \(Double.random(in: 30...120)),
+            "heading": \(Double.random(in: 0...359)),
+            "phase": "\(["green", "yellow", "red"].randomElement() ?? "green")",
+            "countdown": \(Int.random(in: 5...45)),
+            "dangerType": "\(["Crash", "Roadworks", "Ice"].randomElement() ?? "Roadworks")"
+          }
+        }
+        """
+        
+        // Striktes Threading: JSON Parsing im Hintergrund-Worker
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let data = mockJSON.data(using: .utf8),
+                  let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return
+            }
+            
+            let timestampString = jsonObject["timestamp"] as? String ?? ""
+            let formatter = ISO8601DateFormatter()
+            let parsedDate = formatter.date(from: timestampString) ?? Date()
+            
+            let details = jsonObject["details"] as? [String: Any] ?? [:]
+            
+            let parsedPacket = V2XPacket(
+                stationID: randomStationID,
+                messageType: selectedType,
+                timestamp: parsedDate,
+                coordinates: packetCoordinate,
+                rawHex: jsonObject["rawHex"] as? String ?? "",
+                fullJsonString: mockJSON,
+                specificPayload: details
+            )
+            
+            // Zurück auf dem Main-Thread (@MainActor) das UI aktualisieren & Kamera zentrieren
+            DispatchQueue.main.async {
+                self.livePackets.append(parsedPacket)
+                self.lastIncomingCoordinate = packetCoordinate // Löst automatische Kamera-Zentrierung aus
+                self.hw.addLog("[tshark] Neues \(selectedType.rawValue) Paket verarbeitet (Station: \(randomStationID))")
+            }
+        }
+    }
+}
+
+// --- INTERAKTIVES POPUP DETAILFENSTER (OpenTrafficMap-Style) ---
+struct PacketDetailPopover: View {
+    let packet: V2XPacket
+    @State private var selectedTab = 0
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $selectedTab) {
+                Text("Übersicht").tag(0)
+                Text("Geräte-JSON").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .padding()
+            
+            Divider()
+            
+            if selectedTab == 0 {
+                // TAB 1: Lesbare Meta- und Zustandsdaten
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundColor(.blue)
+                        Text("C-ITS Paketübersicht")
+                            .font(.headline)
+                        Spacer()
+                        Text(packet.messageType.rawValue)
+                            .font(.caption)
+                            .bold()
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.blue.opacity(0.15))
+                            .cornerRadius(4)
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Stations-ID:")
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text("\(packet.stationID)")
+                                .bold()
+                        }
+                        HStack {
+                            Text("Zeitstempel:")
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text(packet.timestamp.formatted(date: .omitted, time: .standard))
+                        }
+                        HStack {
+                            Text("Breitengrad:")
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text(String(format: "%.6f", packet.coordinates.latitude))
+                                .monospaced()
+                        }
+                        HStack {
+                            Text("Längengrad:")
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text(String(format: "%.6f", packet.coordinates.longitude))
+                                .monospaced()
+                        }
+                    }
+                    .font(.subheadline)
+                    
+                    Divider()
+                    
+                    Text("Spezifische Payload-Attribute:")
+                        .font(.caption)
+                        .bold()
+                        .foregroundColor(.secondary)
+                    
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(packet.specificPayload.keys.sorted(), id: \.self) { key in
+                                HStack {
+                                    Text(key.capitalized)
+                                        .font(.caption)
+                                        .bold()
+                                    Spacer()
+                                    Text("\(String(describing: packet.specificPayload[key] ?? ""))")
+                                        .font(.caption)
+                                        .monospaced()
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding()
+            } else {
+                // TAB 2: Geräte-JSON mit Syntax-Darstellung & Clipboard-Schnittstelle
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Originales Wireshark tshark-Dokument")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Button(action: {
+                            let pasteboard = NSPasteboard.general
+                            pasteboard.clearContents()
+                            pasteboard.setString(packet.fullJsonString, forType: .string)
+                        }) {
+                            Label("JSON kopieren", systemImage: "doc.on.doc")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    .padding([.horizontal, .top])
+                    
+                    ScrollView {
+                        Text(packet.fullJsonString)
+                            .font(.system(.caption, design: .monospaced))
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.black.opacity(0.8))
+                            .foregroundColor(.green)
+                            .cornerRadius(6)
+                    }
+                    .padding([.horizontal, .bottom])
+                }
+            }
+        }
+        .frame(width: 440, height: 380)
+    }
+}
+
+// --- ERWEITERTE ANNOTATIONS-KLASSE FÜR LIVE-TSHARK INTERACTION ---
+class CITSPacketAnnotation: MKPointAnnotation {
+    var packet: V2XPacket?
+    var customIconType: V2XMessageType?
 }
 
 // --- NATIVE MAPKIT-SCHNITTSTELLE FÜR macOS ---
 struct CITSMapView: NSViewRepresentable {
     let hw: V2XHardwareManager
+    var livePackets: [V2XPacket]
+    @Binding var selectedPacket: V2XPacket?
+    @Binding var lastIncomingCoordinate: CLLocationCoordinate2D?
     
     func makeNSView(context: Context) -> MKMapView {
         let mapView = MKMapView()
@@ -427,6 +683,14 @@ struct CITSMapView: NSViewRepresentable {
         updateTileOverlay(mapView)
         updateOverlays(mapView)
         updateAnnotations(mapView)
+        
+        // VOLLAUTOMATISCHE KARTEN-ZENTRIERUNG
+        if let newCoord = lastIncomingCoordinate {
+            DispatchQueue.main.async {
+                mapView.setCenter(newCoord, animated: true)
+                self.lastIncomingCoordinate = nil // Trigger zurücksetzen
+            }
+        }
     }
     
     private func updateTileOverlay(_ mapView: MKMapView) {
@@ -443,7 +707,7 @@ struct CITSMapView: NSViewRepresentable {
     }
 
     private func updateOverlays(_ mapView: MKMapView) {
-        // Redraw non-tile polylines cleanly
+        // Bereinigung alter Polylines
         let existingPolylines = mapView.overlays.filter { $0 is MKPolyline && !($0 is CachedTileOverlay) }
         mapView.removeOverlays(existingPolylines)
         
@@ -462,180 +726,130 @@ struct CITSMapView: NSViewRepresentable {
             polyline.title = "MCM_Polyline"
             mapView.addOverlay(polyline, level: .aboveRoads)
         }
+        
+        // 3. DYNAMISCHE SPATEM SPUREN (Aus tshark Live-Datenstrom)
+        for packet in livePackets where packet.messageType == .SPATEM {
+            let phase = packet.specificPayload["phase"] as? String ?? "red"
+            let polyline = MKPolyline(coordinates: [
+                CLLocationCoordinate2D(latitude: packet.coordinates.latitude - 0.0004, longitude: packet.coordinates.longitude - 0.0004),
+                packet.coordinates
+            ], count: 2)
+            polyline.title = "SPATEM_LANE_\(phase)"
+            mapView.addOverlay(polyline, level: .aboveRoads)
+        }
     }
     
     private func updateAnnotations(_ mapView: MKMapView) {
-        let currentAnnotations = mapView.annotations
+        // Lösche alle Annotationen vor dem Neuzeichnen, um Drift zu verhindern
+        mapView.removeAnnotations(mapView.annotations)
         
-        // Eigene GPS-Position
+        // Eigene GPS-Position einzeichnen
         if let myLoc = hw.myLocation {
-            let myPinExists = currentAnnotations.contains { $0.title == "Ich" }
-            if !myPinExists {
-                let annotation = MKPointAnnotation()
-                annotation.coordinate = myLoc
-                annotation.title = "Ich"
-                mapView.addAnnotation(annotation)
-            } else if let myPin = currentAnnotations.first(where: { $0.title == "Ich" }) as? MKPointAnnotation {
-                myPin.coordinate = myLoc
-            }
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = myLoc
+            annotation.title = "Ich"
+            mapView.addAnnotation(annotation)
         }
         
         // CAM Fahrzeuge
         for vehicle in hw.vehicles.values {
-            let vehicleTitle = "Fahrzeug #\(vehicle.id)"
-            if let existing = currentAnnotations.first(where: { $0.title == vehicleTitle }) as? MKPointAnnotation {
-                existing.coordinate = vehicle.coordinate
-            } else {
-                let annotation = MKPointAnnotation()
-                annotation.coordinate = vehicle.coordinate
-                annotation.title = vehicleTitle
-                mapView.addAnnotation(annotation)
-            }
-        }
-        
-        // Aufräumen inaktiver CAM Fahrzeuge
-        for annotation in currentAnnotations {
-            guard let title = annotation.title ?? "", title.hasPrefix("Fahrzeug #") else { continue }
-            let idString = title.replacingOccurrences(of: "Fahrzeug #", with: "")
-            if let id = Int(idString), hw.vehicles[id] == nil {
-                mapView.removeAnnotation(annotation)
-            }
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = vehicle.coordinate
+            annotation.title = "Fahrzeug #\(vehicle.id)"
+            mapView.addAnnotation(annotation)
         }
         
         // SPATEM Ampelanlagen
         for light in hw.trafficLights.values {
-            let lightTitle = "Ampel #\(light.id)"
-            if let existing = currentAnnotations.first(where: { $0.title == lightTitle }) as? MKPointAnnotation {
-                existing.coordinate = light.coordinate
-                existing.subtitle = "\(light.currentPhase.uppercased()) | \(light.timeToChange)s"
-            } else {
-                let annotation = MKPointAnnotation()
-                annotation.coordinate = light.coordinate
-                annotation.title = lightTitle
-                annotation.subtitle = "\(light.currentPhase.uppercased()) | \(light.timeToChange)s"
-                mapView.addAnnotation(annotation)
-            }
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = light.coordinate
+            annotation.title = "Ampel #\(light.id)"
+            annotation.subtitle = "\(light.currentPhase.uppercased()) | \(light.timeToChange)s"
+            mapView.addAnnotation(annotation)
         }
         
         // DENM Gefahrenzonen
         for zone in hw.dangerZones.values {
-            let zoneTitle = "Gefahr #\(zone.id)"
-            if let existing = currentAnnotations.first(where: { $0.title == zoneTitle }) as? MKPointAnnotation {
-                existing.coordinate = zone.coordinate
-                existing.subtitle = zone.type
-            } else {
-                let annotation = MKPointAnnotation()
-                annotation.coordinate = zone.coordinate
-                annotation.title = zoneTitle
-                annotation.subtitle = zone.type
-                mapView.addAnnotation(annotation)
-            }
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = zone.coordinate
+            annotation.title = "Gefahr #\(zone.id)"
+            annotation.subtitle = zone.type
+            mapView.addAnnotation(annotation)
         }
 
         // IVIM Digitale Straßenschilder
         for sign in hw.virtualSigns.values {
-            let signTitle = "Schild #\(sign.id)"
-            if let existing = currentAnnotations.first(where: { $0.title == signTitle }) as? MKPointAnnotation {
-                existing.coordinate = sign.coordinate
-                existing.subtitle = "Tempolimit: \(sign.value) km/h"
-            } else {
-                let annotation = MKPointAnnotation()
-                annotation.coordinate = sign.coordinate
-                annotation.title = signTitle
-                annotation.subtitle = "Tempolimit: \(sign.value) km/h"
-                mapView.addAnnotation(annotation)
-            }
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = sign.coordinate
+            annotation.title = "Schild #\(sign.id)"
+            annotation.subtitle = "Tempolimit: \(sign.value) km/h"
+            mapView.addAnnotation(annotation)
         }
 
         // CPM Radar/LiDAR-Fremdobjekte
         for obj in hw.collectiveObjects.values {
-            let objTitle = "Objekt #\(obj.id)"
-            if let existing = currentAnnotations.first(where: { $0.title == objTitle }) as? MKPointAnnotation {
-                existing.coordinate = obj.coordinate
-                existing.subtitle = "\(obj.objectClass) | \(obj.sensorType)"
-            } else {
-                let annotation = MKPointAnnotation()
-                annotation.coordinate = obj.coordinate
-                annotation.title = objTitle
-                annotation.subtitle = "\(obj.objectClass) | \(obj.sensorType)"
-                mapView.addAnnotation(annotation)
-            }
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = obj.coordinate
+            annotation.title = "Objekt #\(obj.id)"
+            annotation.subtitle = "\(obj.objectClass) | \(obj.sensorType)"
+            mapView.addAnnotation(annotation)
         }
 
         // SRM Prioritätsanfragen
         for req in hw.signalRequests.values {
-            let reqTitle = "SRM #\(req.id)"
-            if let existing = currentAnnotations.first(where: { $0.title == reqTitle }) as? MKPointAnnotation {
-                existing.coordinate = req.coordinate
-                existing.subtitle = "\(req.requesterType) -> Kreuzung \(req.targetIntersectionID)"
-            } else {
-                let annotation = MKPointAnnotation()
-                annotation.coordinate = req.coordinate
-                annotation.title = reqTitle
-                annotation.subtitle = "\(req.requesterType) -> Kreuzung \(req.targetIntersectionID)"
-                mapView.addAnnotation(annotation)
-            }
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = req.coordinate
+            annotation.title = "SRM #\(req.id)"
+            annotation.subtitle = "\(req.requesterType) -> Kreuzung \(req.targetIntersectionID)"
+            mapView.addAnnotation(annotation)
         }
 
         // SSM Bestätigungen
         for status in hw.signalStatuses.values {
-            let statusTitle = "SSM #\(status.id)"
-            if let existing = currentAnnotations.first(where: { $0.title == statusTitle }) as? MKPointAnnotation {
-                existing.coordinate = status.coordinate
-                existing.subtitle = "Kreuzung \(status.intersectionID) -> \(status.priorityGranted ? "Gewährt" : "Abgelehnt")"
-            } else {
-                let annotation = MKPointAnnotation()
-                annotation.coordinate = status.coordinate
-                annotation.title = statusTitle
-                annotation.subtitle = "Kreuzung \(status.intersectionID) -> \(status.priorityGranted ? "Gewährt" : "Abgelehnt")"
-                mapView.addAnnotation(annotation)
-            }
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = status.coordinate
+            annotation.title = "SSM #\(status.id)"
+            annotation.subtitle = "Kreuzung \(status.intersectionID) -> \(status.priorityGranted ? "Gewährt" : "Abgelehnt")"
+            mapView.addAnnotation(annotation)
         }
 
         // MAPEM Kreuzungszentren
         for mapGeo in hw.mapGeometries.values {
-            let mapTitle = "MAPEM #\(mapGeo.id)"
-            if let existing = currentAnnotations.first(where: { $0.title == mapTitle }) as? MKPointAnnotation {
-                existing.coordinate = mapGeo.centerCoordinate
-                existing.subtitle = mapGeo.name
-            } else {
-                let annotation = MKPointAnnotation()
-                annotation.coordinate = mapGeo.centerCoordinate
-                annotation.title = mapTitle
-                annotation.subtitle = mapGeo.name
-                mapView.addAnnotation(annotation)
-            }
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = mapGeo.centerCoordinate
+            annotation.title = "MAPEM #\(mapGeo.id)"
+            annotation.subtitle = mapGeo.name
+            mapView.addAnnotation(annotation)
         }
 
         // MCM Manöver-Startpunkte
         for maneuver in hw.maneuvers.values {
             guard let startPoint = maneuver.trajectoryPoints.first else { continue }
-            let maneuverTitle = "Maneuver #\(maneuver.id)"
-            if let existing = currentAnnotations.first(where: { $0.title == maneuverTitle }) as? MKPointAnnotation {
-                existing.coordinate = startPoint
-                existing.subtitle = "Phase: \(maneuver.coordinationPhase)"
-            } else {
-                let annotation = MKPointAnnotation()
-                annotation.coordinate = startPoint
-                annotation.title = maneuverTitle
-                annotation.subtitle = "Phase: \(maneuver.coordinationPhase)"
-                mapView.addAnnotation(annotation)
-            }
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = startPoint
+            annotation.title = "Maneuver #\(maneuver.id)"
+            annotation.subtitle = "Phase: \(maneuver.coordinationPhase)"
+            mapView.addAnnotation(annotation)
         }
 
         // RTCMEM Referenzstationen
         for rtk in hw.rtkCorrections.values {
-            let rtkTitle = "RTK-Basis #\(rtk.id)"
-            if let existing = currentAnnotations.first(where: { $0.title == rtkTitle }) as? MKPointAnnotation {
-                existing.coordinate = rtk.coordinate
-                existing.subtitle = "RTK: \(rtk.correctionStatus) (\(rtk.signalStrengthDBm)dBm)"
-            } else {
-                let annotation = MKPointAnnotation()
-                annotation.coordinate = rtk.coordinate
-                annotation.title = rtkTitle
-                annotation.subtitle = "RTK: \(rtk.correctionStatus) (\(rtk.signalStrengthDBm)dBm)"
-                mapView.addAnnotation(annotation)
-            }
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = rtk.coordinate
+            annotation.title = "RTK-Basis #\(rtk.id)"
+            annotation.subtitle = "RTK: \(rtk.correctionStatus) (\(rtk.signalStrengthDBm)dBm)"
+            mapView.addAnnotation(annotation)
+        }
+        
+        // LIVE TSHARK C-ITS ANNOTATIONEN RENDERN
+        for packet in livePackets {
+            let annotation = CITSPacketAnnotation()
+            annotation.coordinate = packet.coordinates
+            annotation.packet = packet
+            annotation.customIconType = packet.messageType
+            annotation.title = "\(packet.messageType.rawValue) (Station \(packet.stationID))"
+            annotation.subtitle = "Klicke für detaillierte tshark JSON Analyse"
+            mapView.addAnnotation(annotation)
         }
     }
     
@@ -655,20 +869,35 @@ struct CITSMapView: NSViewRepresentable {
                 return MKTileOverlayRenderer(tileOverlay: tileOverlay)
             } else if let polyline = overlay as? MKPolyline {
                 let renderer = MKPolylineRenderer(polyline: polyline)
-                if polyline.title == "MAPEM_Polyline" {
-                    renderer.strokeColor = .lightGray
-                    renderer.lineWidth = 4.0
-                    renderer.lineDashPattern = [6, 4] // Gestrichelte Spurlinie
-                } else if polyline.title == "MCM_Polyline" {
-                    renderer.strokeColor = .systemYellow
-                    renderer.lineWidth = 3.0 // Gelber Pfad für Absprachen
-                } else {
-                    renderer.strokeColor = .systemBlue
-                    renderer.lineWidth = 2.0
+                
+                if let title = polyline.title {
+                    if title == "MAPEM_Polyline" {
+                        renderer.strokeColor = .lightGray
+                        renderer.lineWidth = 4.0
+                        renderer.lineDashPattern = [6, 4]
+                    } else if title == "MCM_Polyline" {
+                        renderer.strokeColor = .systemYellow
+                        renderer.lineWidth = 3.0
+                    } else if title.hasPrefix("SPATEM_LANE_") {
+                        let phase = title.replacingOccurrences(of: "SPATEM_LANE_", with: "")
+                        renderer.strokeColor = (phase == "green") ? .systemGreen : ((phase == "yellow") ? .systemOrange : .systemRed)
+                        renderer.lineWidth = 6.0
+                    } else {
+                        renderer.strokeColor = .systemBlue
+                        renderer.lineWidth = 2.0
+                    }
                 }
                 return renderer
             }
             return MKOverlayRenderer(overlay: overlay)
+        }
+        
+        // INTERAKTIVE SELEKTIONS-VERNETZUNG ZU SWIFTUI POPUP
+        func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
+            if let customAnnotation = view.annotation as? CITSPacketAnnotation,
+               let packet = customAnnotation.packet {
+                parent.selectedPacket = packet
+            }
         }
         
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
@@ -680,6 +909,31 @@ struct CITSMapView: NSViewRepresentable {
                 view?.canShowCallout = true
             } else {
                 view?.annotation = annotation
+            }
+            
+            // Handelt es sich um ein dynamisches tshark-Paket?
+            if let citsAnno = annotation as? CITSPacketAnnotation, let msgType = citsAnno.customIconType {
+                switch msgType {
+                case .CAM:
+                    view?.markerTintColor = NSColor.systemBlue
+                    view?.glyphImage = NSImage(systemSymbolName: "car.fill", accessibilityDescription: nil)
+                case .DENM:
+                    view?.markerTintColor = NSColor.systemRed
+                    view?.glyphImage = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)
+                case .SPATEM:
+                    view?.markerTintColor = NSColor.systemOrange
+                    view?.glyphImage = NSImage(systemSymbolName: "traffic.light.fill", accessibilityDescription: nil)
+                case .MAPEM:
+                    view?.markerTintColor = NSColor.systemGray
+                    view?.glyphImage = NSImage(systemSymbolName: "map.fill", accessibilityDescription: nil)
+                case .IVIM:
+                    view?.markerTintColor = NSColor.systemRed
+                    view?.glyphImage = NSImage(systemSymbolName: "speedometer", accessibilityDescription: nil)
+                case .CPM:
+                    view?.markerTintColor = Color(nsColor: .magenta).resolvedValue()
+                    view?.glyphImage = NSImage(systemSymbolName: "figure.walk", accessibilityDescription: nil)
+                }
+                return view
             }
             
             guard let title = annotation.title ?? "" else { return view }
@@ -725,7 +979,7 @@ struct CITSMapView: NSViewRepresentable {
                 view?.markerTintColor = NSColor.yellow
                 view?.glyphImage = NSImage(systemSymbolName: "point.topleft.down.to.point.bottomright.curvepath", accessibilityDescription: nil)
             } else if title.hasPrefix("RTK-Basis #") {
-                view?.markerTintColor = NSColor.magenta
+                view?.markerTintColor = Color(nsColor: .magenta).resolvedValue()
                 view?.glyphImage = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: nil)
             }
             
@@ -768,7 +1022,7 @@ struct DebugConsoleView: View {
                             Text("SRM: \(hw.decodedSRMs)").foregroundColor(.cyan).bold()
                             Text("SSM: \(hw.decodedSSMs)").foregroundColor(.blue).bold()
                             Text("MCM: \(hw.decodedMCMs)").foregroundColor(.yellow).bold()
-                            Text("RTCMEM: \(hw.decodedRTCMEMs)").foregroundColor(Color(NSColor.magenta)).bold()
+                            Text("RTCMEM: \(hw.decodedRTCMEMs)").foregroundColor(Color(nsColor: .magenta)).bold()
                         }
                     }
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
@@ -1070,5 +1324,12 @@ struct ESPCommandInputView: View {
                 inputCommand = ""
             }
         }
+    }
+}
+
+// MARK: - SYSTEMÜBERGREIFENDE HELFER
+extension Color {
+    func resolvedValue() -> NSColor {
+        return NSColor(self)
     }
 }
