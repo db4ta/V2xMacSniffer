@@ -3,6 +3,7 @@ import MapKit
 import AppKit
 
 // MARK: - ERWEITERTES C-ITS DATENMODELL
+/// Beschreibt den Typ einer empfangenen oder simulierten kooperativen V2X-Nachricht.
 enum V2XMessageType: String, Codable, CaseIterable {
     case CAM = "CAM"
     case DENM = "DENM"
@@ -12,6 +13,7 @@ enum V2XMessageType: String, Codable, CaseIterable {
     case CPM = "CPM"
 }
 
+/// Datenstruktur für den tshark Live-Datenstrom zur Anzeige im Cockpit.
 struct V2XPacket: Identifiable, Equatable {
     let id = UUID()
     let stationID: UInt32
@@ -27,7 +29,7 @@ struct V2XPacket: Identifiable, Equatable {
     }
 }
 
-// Dedizierter Formatter für Ports, der jegliche Tausendertrennung (Gruppierung) unterdrückt
+/// Port-Formatierer ohne Tausendertrennzeichen (Gruppierung).
 private let portFormatter: NumberFormatter = {
     let formatter = NumberFormatter()
     formatter.numberStyle = .none
@@ -35,410 +37,567 @@ private let portFormatter: NumberFormatter = {
     return formatter
 }()
 
+// MARK: - Custom Reusable UI components
+/// Eine standardisierte "Card" für das Sidebar-Design-System zur strukturellen Visualisierung.
+struct SidebarCard<Content: View>: View {
+    let title: String
+    let icon: String
+    let content: Content
+    
+    init(_ title: String, icon: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.icon = icon
+        self.content = content()
+    }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .foregroundColor(.accentColor)
+                    .font(.system(size: 11, weight: .bold))
+                Text(title.uppercased())
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.bottom, 2)
+            
+            content
+        }
+        .padding(12)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+}
+
+// MARK: - Terminal-Ansicht (Putty-Stil)
+/// Eine wiederverwendbare Terminal-Ansicht, die eintreffende Log-Einträge fortlaufend im Putty-Stil darstellt.
+struct PuttyTerminalView: View {
+    let entries: [LogEntry]
+    let textColor: Color
+    
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    // Zeigt die Logs chronologisch an (neueste Einträge fließen unten ein)
+                    ForEach(entries) { entry in
+                        Text("[\(entry.timestamp.formatted(.dateTime.hour().minute().second()))] \(entry.text)")
+                            .font(.system(size: 10, weight: .regular, design: .monospaced))
+                            .foregroundColor(textColor)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .id(entry.id)
+                    }
+                }
+                .padding(8)
+            }
+            .background(Color.black)
+            .cornerRadius(6)
+            .onChange(of: entries) { _, _ in
+                // Automatisches Herunterscrollen zur neuesten Logzeile bei Datenempfang
+                if let last = entries.last {
+                    withAnimation {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - ContentView Hauptansicht
 struct ContentView: View {
-    // Shared State Schnittstelle
+    // Shared State Schnittstelle zur Hardwaresteuerung
     var hw: V2XHardwareManager
     
     // Nativer SwiftUI Fenstermanager
     @Environment(\.openWindow) private var openSwiftUIWindow
     @Environment(\.dismissWindow) private var dismissSwiftUIWindow
 
-    // Typsichere Direktzugriffe ohne unsicheres KVC-AnyObject-Casting zur Vermeidung von Laufzeit-Crashes
     private var v2xIsOpen: Bool { hw.v2xPortOpen }
     private var v2xIsManuallyConnected: Bool { hw.isV2XManuallyConnected }
     private var gpsIsOpen: Bool { hw.gpsPortOpen }
     private var gpsIsManuallyConnected: Bool { hw.isGPSManuallyConnected }
     
-    // Live-Feed der neu strukturierten tshark V2X Pakete
+    // Live-Feed-Datenströme
     @State private var livePackets: [V2XPacket] = []
     @State private var selectedPacket: V2XPacket? = nil
     @State private var lastIncomingCoordinate: CLLocationCoordinate2D? = nil
     @State private var isShowingDetailPopover = false
     
+    // Fehler- und Puffer-Zustände
+    @State private var showErrorAlert: Bool = false
+    @State private var lastErrorMessage: String = ""
+    @State private var tsharkJSONBuffer: Data = Data()
+    @AppStorage("isTsharkSimulationEnabled") private var isTsharkSimulationEnabled: Bool = false
+
     var body: some View {
-        // Lokale Bindable-Deklaration für fehlerfreie SwiftUI-Bindings
         @Bindable var hw = hw
         
         NavigationSplitView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    
+                    // Kopfzeile mit Aktualisierungs-Trigger
                     HStack {
-                        Text("V2X Mac-Zentrale").font(.headline).bold()
+                        Text("V2X Mac-Zentrale")
+                            .font(.system(size: 16, weight: .bold))
                         Spacer()
                         Button(action: { hw.scanPorts() }) {
                             Image(systemName: "arrow.clockwise")
                                 .font(.caption)
                         }
                         .buttonStyle(.plain)
-                        .help("Ports scannen")
+                        .help("Verfügbare Ports neu scannen")
                     }
+                    .padding(.bottom, 4)
                     
-                    // Live Test-Generator zur Simulation von echtem tshark-Datenfluss
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("TSHARK LIVE-SIMULATOR").font(.caption2).bold().foregroundColor(.secondary)
-                        Button(action: simulateIncomingTsharkJSON) {
-                            Label("tshark JSON einspeisen", systemImage: "bolt.horizontal.fill")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.purple)
-                    }
-                    
-                    Divider()
-                    
-                    // Status-Leuchtdioden
-                    Group {
-                        HStack {
-                            Circle()
-                                .fill(v2xIsOpen ? .green : (v2xIsManuallyConnected ? .yellow : .red))
-                                .frame(width: 8, height: 8)
-                            Text("V2X-USB (\(hw.lockedV2XBaud))")
-                        }
-                        HStack {
-                            Circle()
-                                .fill(gpsIsOpen ? .green : (gpsIsManuallyConnected ? .yellow : .red))
-                                .frame(width: 8, height: 8)
-                            Text("GPS-USB (\(hw.lockedGPSBaud))")
-                        }
-                        HStack {
-                            Circle()
-                                .fill(hw.serverRunning ? .green : .red)
-                                .frame(width: 8, height: 8)
-                            Text("iOS-Server (Port \(hw.serverPort.description))")
-                        }
-                    }.font(.caption)
-                    
-                    Divider()
-                    
-                    // ESP32 V2X-Empfänger Steuerung
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("ESP32 V2X MODEM").font(.caption).bold().foregroundColor(.gray)
-                        
-                        Picker("Port:", selection: $hw.selectedV2XPort) {
-                            Text("Kein Port ausgewählt").tag("")
-                            ForEach(hw.availablePorts, id: \.self) { port in
-                                Text(port.replacingOccurrences(of: "/dev/cu.", with: "")).tag(port)
+                    // 1. SYSTEMSTATUS LEDS
+                    SidebarCard("Systemstatus", icon: "bolt.heart.fill") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Circle()
+                                    .fill(v2xIsOpen ? .green : (v2xIsManuallyConnected ? .yellow : .red))
+                                    .frame(width: 8, height: 8)
+                                Text("V2X-USB: ")
+                                    .foregroundColor(.secondary)
+                                Text(v2xIsOpen ? "Verbunden (\(hw.lockedV2XBaud))" : "Getrennt")
+                                    .bold()
+                            }
+                            HStack {
+                                Circle()
+                                    .fill(gpsIsOpen ? .green : (gpsIsManuallyConnected ? .yellow : .red))
+                                    .frame(width: 8, height: 8)
+                                Text("GPS-USB: ")
+                                    .foregroundColor(.secondary)
+                                Text(gpsIsOpen ? "Verbunden (\(hw.lockedGPSBaud))" : "Getrennt")
+                                    .bold()
+                            }
+                            HStack {
+                                Circle()
+                                    .fill(hw.serverRunning ? .green : .red)
+                                    .frame(width: 8, height: 8)
+                                Text("iOS-Server: ")
+                                    .foregroundColor(.secondary)
+                                Text(hw.serverRunning ? "Aktiv (Port \(hw.serverPort.description))" : "Inaktiv")
+                                    .bold()
                             }
                         }
-                        .labelsHidden()
-                        .disabled(v2xIsManuallyConnected)
-                        
-                        HStack {
-                            Text("Baudrate:").font(.caption).foregroundColor(.secondary)
-                            Picker("", selection: $hw.selectedV2XBaud) {
-                                ForEach(hw.v2xBaudOptions, id: \.self) { baud in
-                                    if baud == "921600" {
-                                        Text("\(baud) (pit711 Standard)").tag(baud).font(.headline).bold()
-                                    } else {
+                        .font(.system(size: 11))
+                    }
+                    
+                    // 2. VERBINDUNGSSTATUS (RX-RATE)
+                    SidebarCard("Verbindungsstatus", icon: "activity") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Port:")
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text(hw.selectedV2XPort.isEmpty ? "–" : hw.selectedV2XPort.replacingOccurrences(of: "/dev/cu.", with: ""))
+                                    .monospaced()
+                                    .bold()
+                            }
+                            
+                            HStack {
+                                Text("Rx-Übertragung:")
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                if let obj = hw as? NSObject, let rxRateBps = obj.value(forKey: "v2xRxRateBps") as? Double {
+                                    Text(String(format: "%.2f kB/s", rxRateBps / 1000.0))
+                                        .monospaced()
+                                        .bold()
+                                } else {
+                                    Text(String(format: "%.2f kB/s", Double(hw.totalV2XBytesRx) / 1000.0))
+                                        .monospaced()
+                                        .bold()
+                                }
+                            }
+                            
+                            Button(action: {
+                                if let obj = hw as? NSObject, let lastError = obj.value(forKey: "lastV2XError") as? String, !lastError.isEmpty {
+                                    lastErrorMessage = lastError
+                                } else {
+                                    lastErrorMessage = "Keine aufgezeichneten Fehler auf dem Bus."
+                                }
+                                showErrorAlert = true
+                            }) {
+                                Label("Bus-Fehler prüfen", systemImage: "exclamationmark.bubble")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                        .font(.system(size: 11))
+                    }
+                    
+                    // 3. ESP32 V2X MODEM STEUERUNG (PROMINENTER HAUPTKNOPF)
+                    SidebarCard("ESP32 V2X Modem", icon: "cpu") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Picker("Port:", selection: $hw.selectedV2XPort) {
+                                Text("Kein Port ausgewählt").tag("")
+                                ForEach(hw.availablePorts, id: \.self) { port in
+                                    Text(port.replacingOccurrences(of: "/dev/cu.", with: "")).tag(port)
+                                }
+                            }
+                            .controlSize(.small)
+                            .disabled(v2xIsManuallyConnected)
+                            
+                            HStack {
+                                Text("Baudrate:")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text("921600 Baud")
+                                    .font(.caption)
+                                    .bold()
+                            }
+                            .help("Die Hardware benötigt zwingend 921600 Baud.")
+                            
+                            Button(action: { hw.toggleV2XConnection() }) {
+                                HStack {
+                                    Image(systemName: v2xIsManuallyConnected ? "bolt.slash.fill" : "bolt.fill")
+                                    Text(v2xIsManuallyConnected ? "V2X trennen" : "V2X verbinden")
+                                        .bold()
+                                }
+                                .frame(maxWidth: .infinity, minHeight: 22)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(v2xIsManuallyConnected ? .red : .blue)
+                        }
+                    }
+                    
+                    // 4. OFFLINE-KARTEN CACHE MANAGER (MIT CACHE-GRÖSSE & RATELIMIT)
+                    SidebarCard("Offline-Karten & Cache", icon: "map.fill") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Toggle("Offline-Modus aktivieren", isOn: $hw.isOfflineMapActive)
+                                .font(.caption).bold()
+                                .toggleStyle(.checkbox)
+                            
+                            HStack {
+                                Text("Lokaler Cache:")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text(hw.cacheSizeString)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .bold()
+                            }
+                            
+                            Divider()
+                            
+                            Text("Region vorab herunterladen:").font(.caption2).bold().foregroundColor(.secondary)
+                            Picker("", selection: $hw.selectedOfflineRegion) {
+                                ForEach(hw.offlineRegionOptions, id: \.self) { region in
+                                    Text(region).tag(region)
+                                }
+                            }
+                            .labelsHidden()
+                            .controlSize(.small)
+                            .disabled(hw.isDownloadingMap)
+                            
+                            HStack {
+                                Text("Max. Zoom:")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Stepper(value: $hw.maxDownloadZoomLevel, in: 10...17) {
+                                    Text("\(hw.maxDownloadZoomLevel)")
+                                        .font(.system(size: 11, design: .monospaced))
+                                }
+                                .disabled(hw.isDownloadingMap)
+                            }
+                            
+                            if hw.isDownloadingMap {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    ProgressView(value: hw.downloadProgress)
+                                        .progressViewStyle(.linear)
+                                    HStack {
+                                        Text("\(hw.downloadedTilesCount) / \(hw.totalTilesToDownload) Kacheln")
+                                            .font(.system(size: 9, design: .monospaced))
+                                        Spacer()
+                                        Button("Abbrechen") {
+                                            hw.cancelOfflineMapDownload()
+                                        }
+                                        .buttonStyle(.plain)
+                                        .font(.system(size: 9))
+                                        .foregroundColor(.red)
+                                    }
+                                }
+                                .padding(.top, 4)
+                            } else {
+                                Button(action: { hw.startOfflineMapDownload() }) {
+                                    Label("Region laden", systemImage: "arrow.down.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(.green)
+                            }
+                            
+                            Divider()
+                            
+                            HStack(spacing: 8) {
+                                Button(action: { hw.importMBTilesFile() }) {
+                                    Label("Import", systemImage: "doc.badge.plus")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                
+                                Button(action: { hw.exportCacheToMBTiles() }) {
+                                    Label("Export", systemImage: "square.and.arrow.up")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                            
+                            Button(role: .destructive, action: { hw.clearTileCache() }) {
+                                Label("Cache leeren", systemImage: "trash")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.red)
+                            .controlSize(.small)
+                        }
+                    }
+                    
+                    // 5. VEHICLE TRAILS
+                    SidebarCard("Fahrzeugspuren", icon: "point.topleft.down.to.point.bottomright.curvepath") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Toggle("Spur behalten (Kein Auto-Prune)", isOn: $hw.keepVehiclesAsTrail)
+                                .font(.caption).bold()
+                                .toggleStyle(.checkbox)
+                            
+                            HStack {
+                                Text("Max. Punkte pro Spur:")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Stepper(value: $hw.maxTrailPointsPerVehicle, in: 20...2000, step: 20) {
+                                    Text("\(hw.maxTrailPointsPerVehicle)")
+                                        .font(.system(size: 10, design: .monospaced))
+                                }
+                                .disabled(!hw.keepVehiclesAsTrail)
+                            }
+                        }
+                    }
+                    
+                    // 6. GPS EMPFÄNGER (NMEA)
+                    SidebarCard("GPS-Empfänger", icon: "location") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Picker("Port:", selection: $hw.selectedGPSPort) {
+                                Text("Kein Port ausgewählt").tag("")
+                                ForEach(hw.availablePorts, id: \.self) { port in
+                                    Text(port.replacingOccurrences(of: "/dev/cu.", with: "")).tag(port)
+                                }
+                            }
+                            .controlSize(.small)
+                            .disabled(gpsIsManuallyConnected)
+                            
+                            HStack {
+                                Text("Baudrate:").font(.caption).foregroundColor(.secondary)
+                                Picker("", selection: $hw.selectedGPSBaud) {
+                                    ForEach(hw.gpsBaudOptions, id: \.self) { baud in
                                         Text(baud).tag(baud)
                                     }
                                 }
+                                .labelsHidden()
+                                .controlSize(.small)
+                                .disabled(gpsIsManuallyConnected)
                             }
-                            .labelsHidden()
-                            .frame(width: 160)
-                            .disabled(v2xIsManuallyConnected)
-                        }
-                        
-                        Button(action: { hw.toggleV2XConnection() }) {
-                            Text(v2xIsManuallyConnected ? "V2X trennen" : "V2X verbinden")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(v2xIsManuallyConnected ? .red : .blue)
-                    }
-                    
-                    Divider()
-                    
-                    // --- OFFLINE-KARTEN CACHE MANAGER ---
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("OFFLINE-KARTEN CACHE").font(.caption).bold().foregroundColor(.gray)
-                        
-                        Toggle("Offline-Modus aktivieren", isOn: $hw.isOfflineMapActive)
-                            .font(.caption).bold()
-                            .toggleStyle(.checkbox)
-                        
-                        Text("Kacheln werden bei aktivem Internet geladen und für den Offline-Einsatz automatisch auf der Festplatte zwischengespeichert.").font(.system(size: 10)).foregroundColor(.secondary)
-                        
-                        Divider().padding(.vertical, 2)
-                        
-                        Text("Region vorab herunterladen:").font(.caption2).bold().foregroundColor(.secondary)
-                        Picker("", selection: $hw.selectedOfflineRegion) {
-                            ForEach(hw.offlineRegionOptions, id: \.self) { region in
-                                Text(region).tag(region)
-                            }
-                        }
-                        .labelsHidden()
-                        .disabled(hw.isDownloadingMap)
-                        
-                        if hw.isDownloadingMap {
-                            VStack(alignment: .leading, spacing: 4) {
-                                ProgressView(value: hw.downloadProgress)
-                                    .progressViewStyle(.linear)
-                                HStack {
-                                    Text("\(hw.downloadedTilesCount) / \(hw.totalTilesToDownload) Kacheln")
-                                        .font(.system(size: 9, design: .monospaced))
-                                    Spacer()
-                                    Button("Abbrechen") {
-                                        hw.cancelOfflineMapDownload()
-                                    }
-                                    .buttonStyle(.plain)
-                                    .font(.system(size: 9))
-                                    .foregroundColor(.red)
-                                }
-                            }
-                            .padding(.top, 4)
-                        } else {
-                            Button(action: { hw.startOfflineMapDownload() }) {
-                                Label("Region herunterladen", systemImage: "arrow.down.circle.fill")
+                            
+                            Button(action: { hw.toggleGPSConnection() }) {
+                                Text(gpsIsManuallyConnected ? "GPS trennen" : "GPS verbinden")
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.bordered)
-                            .tint(.green)
+                            .tint(gpsIsManuallyConnected ? .red : .blue)
+                            .controlSize(.small)
                         }
                     }
                     
-                    Divider()
-                    
-                    // --- FAHRZEUGSPUREN (TRAILS) STEUERUNG ---
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("FAHRZEUGSPUREN (TRAILS)").font(.caption).bold().foregroundColor(.gray)
-
-                        Toggle("Trails behalten (kein Auto-Prune)", isOn: $hw.keepVehiclesAsTrail)
-                            .font(.caption).bold()
-                            .toggleStyle(.checkbox)
-                            .help("Wenn aktiv, werden inaktive Fahrzeuge nicht automatisch nach 10s entfernt; ihre Spur bleibt erhalten.")
-
-                        HStack(spacing: 8) {
-                            Text("Max. Punkte pro Spur:")
+                    // 7. iOS INTERACTIVE SERVER
+                    SidebarCard("iOS Server", icon: "phone") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("TCP Port:")
+                                TextField("Port", value: $hw.serverPort, formatter: portFormatter)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 60)
+                                    .disabled(hw.serverRunning)
+                                Spacer()
+                                Stepper("", value: $hw.serverPort, in: 1024...65535)
+                                    .labelsHidden()
+                                    .disabled(hw.serverRunning)
+                            }
+                            
+                            Toggle("Web-Debugger aktiv", isOn: $hw.isWebDebugServerEnabled)
                                 .font(.caption)
-                                .foregroundColor(.secondary)
-                            Spacer()
-                            Stepper(value: $hw.maxTrailPointsPerVehicle, in: 20...2000, step: 20) {
-                                Text("\(hw.maxTrailPointsPerVehicle)")
-                                    .font(.system(size: 11, design: .monospaced))
-                            }
-                            .disabled(!hw.keepVehiclesAsTrail)
-                            .help("Begrenzt die Anzahl der gespeicherten Trailpunkte pro Fahrzeug.")
-                        }
-                    }
-
-                    Divider()
-                    
-                    // GPS Empfänger Steuerung
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("GPS-EMPFÄNGER (NMEA)").font(.caption).bold().foregroundColor(.gray)
-                        
-                        Picker("Port:", selection: $hw.selectedGPSPort) {
-                            Text("Kein Port ausgewählt").tag("")
-                            ForEach(hw.availablePorts, id: \.self) { port in
-                                Text(port.replacingOccurrences(of: "/dev/cu.", with: "")).tag(port)
-                            }
-                        }
-                        .labelsHidden()
-                        .disabled(gpsIsManuallyConnected)
-                        
-                        HStack {
-                            Text("Baudrate:").font(.caption).foregroundColor(.secondary)
-                            Picker("", selection: $hw.selectedGPSBaud) {
-                                ForEach(hw.gpsBaudOptions, id: \.self) { baud in
-                                    Text(baud).tag(baud)
-                                }
-                            }
-                            .labelsHidden()
-                            .frame(width: 110)
-                            .disabled(gpsIsManuallyConnected)
-                        }
-                        
-                        Button(action: { hw.toggleGPSConnection() }) {
-                            Text(gpsIsManuallyConnected ? "GPS trennen" : "GPS verbinden")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(gpsIsManuallyConnected ? .red : .blue)
-                    }
-                    
-                    Divider()
-                    
-                    // iOS TCP-Server Konfiguration & Web-Server
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("iOS INTERACTIVE SERVER").font(.caption).bold().foregroundColor(.gray)
-                        HStack {
-                            Text("TCP Port:")
-                            TextField("Port", value: $hw.serverPort, formatter: portFormatter)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 70)
                                 .disabled(hw.serverRunning)
-                            Spacer()
-                            Stepper("", value: $hw.serverPort, in: 1024...65535)
-                                .labelsHidden()
-                                .disabled(hw.serverRunning)
-                        }.font(.caption)
-                        
-                        Toggle("Web-Debugger auf Port \((hw.serverPort + 1).description) aktiv", isOn: $hw.isWebDebugServerEnabled)
-                            .font(.caption)
-                            .disabled(hw.serverRunning)
-                            .padding(.vertical, 2)
-                        
-                        Button(action: { hw.toggleServer() }) {
-                            Text(hw.serverRunning ? "Server stoppen" : "Server starten")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .tint(hw.serverRunning ? .red : .green)
-                        .buttonStyle(.borderedProminent)
-                        
-                        // Anzeige verbundener Clients
-                        if hw.serverRunning {
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack {
-                                    Text("Verbundene Clients:")
-                                        .font(.caption)
-                                        .bold()
-                                    Spacer()
-                                    Text("\(hw.connectedClients.count)")
-                                        .font(.caption)
-                                        .bold()
-                                        .foregroundColor(.green)
-                                }
-                                
-                                if !hw.connectedClients.isEmpty {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        ForEach(hw.connectedClients, id: \.self) { ip in
-                                            HStack {
-                                                Image(systemName: "iphone")
-                                                    .font(.caption2)
-                                                    .foregroundColor(.secondary)
-                                                Text(ip)
-                                                    .font(.system(size: 10, design: .monospaced))
-                                                    .foregroundColor(.primary)
-                                            }
-                                        }
-                                    }
-                                    .padding(6)
-                                    .background(Color.black.opacity(0.15))
-                                    .cornerRadius(4)
-                                }
+                            
+                            Button(action: { hw.toggleServer() }) {
+                                Text(hw.serverRunning ? "Server stoppen" : "Server starten")
+                                    .frame(maxWidth: .infinity)
                             }
-                            .padding(.top, 4)
+                            .tint(hw.serverRunning ? .red : .green)
+                            .buttonStyle(.borderedProminent)
                         }
                     }
                     
-                    Divider()
-                    
-                    // DATEN-AUFZEICHNUNG (FORENSIK) MIT SPEICHERORT-WAHL
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("DATEN-AUFZEICHNUNG (FORENSIK)").font(.caption).bold().foregroundColor(.gray)
-                        
-                        HStack {
-                            Text("Ordner:")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                    // 8. DATA FORENSICS
+                    SidebarCard("Forensische Protokollierung", icon: "opticaldisc") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Log-Verzeichnis:")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Button("Wählen...") { hw.selectLogDirectory() }
+                                    .buttonStyle(.borderless)
+                                    .font(.caption)
+                            }
+                            
                             Text(hw.logDirectoryPathString)
-                                .font(.system(size: 10, design: .monospaced))
+                                .font(.system(size: 9, design: .monospaced))
                                 .foregroundColor(.blue)
                                 .lineLimit(1)
                                 .truncationMode(.head)
-                            Spacer()
-                            Button("Ändern...") {
-                                hw.selectLogDirectory()
-                            }
-                            .buttonStyle(.borderless)
-                            .font(.caption)
-                        }
-                        
-                        Toggle("Wireshark PCAP Exporter", isOn: $hw.isPCAPLoggingActive)
-                            .font(.caption)
-                        if hw.isPCAPLoggingActive {
-                            Text("Datei: \(hw.pcapFilePathString)")
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                        }
-                        
-                        Toggle("CSV Tabellen-Logger", isOn: $hw.isCSVLoggingActive)
-                            .font(.caption)
-                            .padding(.top, 2)
-                        if hw.isCSVLoggingActive {
-                            Text("Datei: \(hw.csvFilePathString)")
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
+                            
+                            Toggle("Wireshark PCAP Exporter", isOn: $hw.isPCAPLoggingActive)
+                                .font(.caption)
+                            Toggle("CSV Tabellen-Logger", isOn: $hw.isCSVLoggingActive)
+                                .font(.caption)
                         }
                     }
                     
-                    Divider()
+                    // 9. COCKPIT-WINDOW TOGGLE
+                    SidebarCard("Hilfswerkzeuge", icon: "macwindow") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Toggle("Debug-Fenster aktiv", isOn: $hw.isDebugWindowActive)
+                                .font(.caption).bold()
+                                .toggleStyle(.checkbox)
+                                .onChange(of: hw.isDebugWindowActive) { _, newValue in
+                                    if newValue {
+                                        openSwiftUIWindow(id: "debug_window")
+                                    } else {
+                                        dismissSwiftUIWindow(id: "debug_window")
+                                    }
+                                }
+                        }
+                    }
                     
-                    // Debug-Schalter zum Ein- und Ausschalten des separaten macOS Fensters
-                    VStack(alignment: .leading, spacing: 4) {
-                        Toggle("Natives Debugger-Fenster", isOn: $hw.isDebugWindowActive)
+                    // 10. KONSOLIDIERTER TSHARK & C-ITS SIMULATOR (ZUSAMMENGEFÜHRTES DESIGN)
+                    SidebarCard("Simulations-Zentrale", icon: "terminal") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Toggle("Automatischer Ablauf", isOn: .init(
+                                get: { hw.isAutoSimulationActive },
+                                set: { _ in hw.toggleAutoSimulation() }
+                            ))
                             .font(.caption).bold()
-                            .onChange(of: hw.isDebugWindowActive) { _, newValue in
-                                if newValue {
-                                    openSwiftUIWindow(id: "debug_window")
-                                } else {
-                                    dismissSwiftUIWindow(id: "debug_window")
+                            .toggleStyle(.switch)
+                            
+                            HStack {
+                                Text("Timer Intervall:")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Stepper(value: $hw.simulationIntervalSeconds, in: 0.5...10.0, step: 0.5) {
+                                    Text(String(format: "%.1f s", hw.simulationIntervalSeconds))
+                                        .font(.system(size: 11, design: .monospaced))
+                                }
+                                .disabled(hw.isAutoSimulationActive)
+                            }
+                            
+                            Divider()
+                            
+                            // Manuelle Einzeleinspeisung als Fallback
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Manuelle Einspeisung:").font(.caption2).foregroundColor(.secondary)
+                                HStack(spacing: 8) {
+                                    Button(action: {
+                                        simulateIncomingTsharkJSON()
+                                    }) {
+                                        Label("tshark JSON", systemImage: "doc.plaintext.fill")
+                                            .frame(maxWidth: .infinity)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                    
+                                    Button(action: {
+                                        hw.simulateCAM()
+                                    }) {
+                                        Label("CAM (PKW)", systemImage: "car.fill")
+                                            .frame(maxWidth: .infinity)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
                                 }
                             }
-                        
-                        if hw.isDebugWindowActive {
-                            Button(action: { openSwiftUIWindow(id: "debug_window") }) {
-                                Label("Debugger anzeigen", systemImage: "terminal.fill")
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(.purple)
                         }
                     }
+                    .background(Color.purple.opacity(0.05).cornerRadius(8))
                     
-                    // GLOSA Dashboard-Anzeige
+                    // 11. GLOSA INFO PANEL
                     if hw.myLocation != nil && !hw.trafficLights.isEmpty {
-                        Divider()
-                        Text("GLOSA Grüne Welle").font(.caption).bold().foregroundColor(.blue)
-                        ForEach(Array(hw.trafficLights.values)) { light in
-                            if let speedRecommendation = hw.calculateGLOSASpeed(to: light) {
-                                HStack {
-                                    Circle()
-                                        .fill(light.currentPhase == "green" ? .green : (light.currentPhase == "yellow" ? .yellow : .red))
-                                        .frame(width: 10, height: 10)
-                                    Text("Licht #\(light.id):")
-                                    Spacer()
-                                    Text("\(Int(speedRecommendation)) km/h")
-                                        .bold()
-                                        .foregroundColor(.green)
-                                }.font(.caption2)
+                        SidebarCard("GLOSA Assistent", icon: "traffic.light.fill") {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(Array(hw.trafficLights.values)) { light in
+                                    if let speedRecommendation = hw.calculateGLOSASpeed(to: light) {
+                                        HStack {
+                                            Circle()
+                                                .fill(light.currentPhase == "green" ? .green : (light.currentPhase == "yellow" ? .yellow : .red))
+                                                .frame(width: 8, height: 8)
+                                            Text("Kreuzung #\(light.id):")
+                                            Spacer()
+                                            Text("\(Int(speedRecommendation)) km/h")
+                                                .bold()
+                                                .foregroundColor(.green)
+                                        }
+                                        .font(.system(size: 11))
+                                    }
+                                }
                             }
                         }
                     }
                     
-                    Divider()
-                    Text("Log-Terminal").font(.caption).foregroundColor(.gray)
-                    
-                    HStack(spacing: 8) {
-                        Button {
-                            hw.copyLogsToClipboard()
-                        } label: {
-                            Label("Logs kopieren", systemImage: "doc.on.doc")
+                    // 12. LOG COCKPIT EXPORT & VIEW
+                    SidebarCard("Echtzeit-Terminal", icon: "scroll") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 8) {
+                                Button {
+                                    hw.copyLogsToClipboard()
+                                } label: {
+                                    Label("Kopieren", systemImage: "doc.on.doc").font(.system(size: 10))
+                                }
+                                .buttonStyle(.bordered)
+                                
+                                Button {
+                                    hw.exportLogsToFile()
+                                } label: {
+                                    Label("Sichern", systemImage: "square.and.arrow.down").font(.system(size: 10))
+                                }
+                                .buttonStyle(.bordered)
+                                Spacer()
+                            }
+                            
+                            List(Array(hw.logs.enumerated()), id: \.offset) { _, log in
+                                Text(log.text)
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundColor(.green)
+                            }
+                            .background(Color.black)
+                            .cornerRadius(4)
+                            .frame(minHeight: 120)
                         }
-                        Button {
-                            hw.exportLogsToFile()
-                        } label: {
-                            Label("Logs exportieren…", systemImage: "square.and.arrow.down")
-                        }
-                        Spacer()
                     }
-                    .padding(.vertical, 2)
-                    
-                    // Haupt-Log-Terminal
-                    List(Array(hw.logs.enumerated()), id: \.offset) { _, log in
-                        Text(displayText(log))
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundColor(.green)
-                    }
-                    .background(.black).cornerRadius(4)
-                    .frame(minHeight: 120)
                 }
                 .padding()
             }
-            .frame(minWidth: 260, maxWidth: 350)
+            .frame(minWidth: 280, maxWidth: 350)
         } detail: {
             ZStack {
                 CITSMapView(
@@ -454,14 +613,14 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 960, minHeight: 600)
+        .alert("V2X Fehler", isPresented: $showErrorAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(lastErrorMessage)
+        }
     }
     
-    // Liefert eine String-Darstellung für beliebige LogEntry-Objekte
-    private func displayText(_ entry: LogEntry) -> String {
-        return entry.text
-    }
-    
-    // Simuliert den asynchronen tshark JSON Parser-Prozess im Hintergrund
+    /// Simuliert den asynchronen tshark JSON Parser-Prozess im Hintergrund
     private func simulateIncomingTsharkJSON() {
         let types: [V2XMessageType] = [.CAM, .DENM, .SPATEM, .MAPEM, .IVIM, .CPM]
         let selectedType = types.randomElement() ?? .CAM
@@ -473,7 +632,6 @@ struct ContentView: View {
             longitude: stuttgartCenter.longitude + Double.random(in: -0.005...0.005)
         )
         
-        // Simulierter originaler tshark JSON-Output
         let mockJSON = """
         {
           "timestamp": "\(ISO8601DateFormatter().string(from: Date()))",
@@ -495,7 +653,6 @@ struct ContentView: View {
         }
         """
         
-        // Striktes Threading: JSON Parsing im Hintergrund-Worker
         DispatchQueue.global(qos: .userInitiated).async {
             guard let data = mockJSON.data(using: .utf8),
                   let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -518,17 +675,18 @@ struct ContentView: View {
                 specificPayload: details
             )
             
-            // Zurück auf dem Main-Thread (@MainActor) das UI aktualisieren & Kamera zentrieren
             DispatchQueue.main.async {
                 self.livePackets.append(parsedPacket)
-                self.lastIncomingCoordinate = packetCoordinate // Löst automatische Kamera-Zentrierung aus
-                self.hw.addLog("[tshark] Neues \(selectedType.rawValue) Paket verarbeitet (Station: \(randomStationID))")
+                self.lastIncomingCoordinate = packetCoordinate
+                self.hw.addLog("[tshark] Simuliertes \(selectedType.rawValue) Paket verarbeitet (Station: \(randomStationID))")
+                // Leite die simulierte Transaktion auch an die Putty Netzwerk-Diagnose weiter
+                self.hw.addDebugPacketLog("[SIM tshark] Simuliertes \(selectedType.rawValue) (Station: \(randomStationID)) - Lat: \(packetCoordinate.latitude), Lon: \(packetCoordinate.longitude)")
             }
         }
     }
 }
 
-// --- INTERAKTIVES POPUP DETAILFENSTER (OpenTrafficMap-Style) ---
+// MARK: - INTERAKTIVES POPUP DETAILFENSTER (OpenTrafficMap-Style)
 struct PacketDetailPopover: View {
     let packet: V2XPacket
     @State private var selectedTab = 0
@@ -545,7 +703,6 @@ struct PacketDetailPopover: View {
             Divider()
             
             if selectedTab == 0 {
-                // TAB 1: Lesbare Meta- und Zustandsdaten
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
                         Image(systemName: "info.circle.fill")
@@ -618,7 +775,6 @@ struct PacketDetailPopover: View {
                 }
                 .padding()
             } else {
-                // TAB 2: Geräte-JSON mit Syntax-Darstellung & Clipboard-Schnittstelle
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Text("Originales Wireshark tshark-Dokument")
@@ -654,13 +810,13 @@ struct PacketDetailPopover: View {
     }
 }
 
-// --- ERWEITERTE ANNOTATIONS-KLASSE FÜR LIVE-TSHARK INTERACTION ---
+// MARK: - ANNOTATIONS-KLASSE FÜR LIVE-TSHARK INTERACTION
 class CITSPacketAnnotation: MKPointAnnotation {
     var packet: V2XPacket?
     var customIconType: V2XMessageType?
 }
 
-// --- NATIVE MAPKIT-SCHNITTSTELLE FÜR macOS ---
+// MARK: - NATIVE MAPKIT-SCHNITTSTELLE FÜR macOS
 struct CITSMapView: NSViewRepresentable {
     let hw: V2XHardwareManager
     var livePackets: [V2XPacket]
@@ -671,7 +827,6 @@ struct CITSMapView: NSViewRepresentable {
         let mapView = MKMapView()
         mapView.delegate = context.coordinator
         
-        // Initialer Fokus auf Stuttgart / Winnenden
         let center = CLLocationCoordinate2D(latitude: 48.7955, longitude: 9.2292)
         let region = MKCoordinateRegion(center: center, span: MKCoordinateSpan(latitudeDelta: 0.015, longitudeDelta: 0.015))
         mapView.setRegion(region, animated: false)
@@ -684,34 +839,36 @@ struct CITSMapView: NSViewRepresentable {
         updateOverlays(mapView)
         updateAnnotations(mapView)
         
-        // VOLLAUTOMATISCHE KARTEN-ZENTRIERUNG
         if let newCoord = lastIncomingCoordinate {
             DispatchQueue.main.async {
                 mapView.setCenter(newCoord, animated: true)
-                self.lastIncomingCoordinate = nil // Trigger zurücksetzen
+                self.lastIncomingCoordinate = nil
             }
         }
     }
     
     private func updateTileOverlay(_ mapView: MKMapView) {
-        let hasOverlay = mapView.overlays.contains { $0 is CachedTileOverlay }
+        let overlays = mapView.overlays.filter { $0 is CachedTileOverlay }
+        mapView.removeOverlays(overlays)
         
-        if hw.isOfflineMapActive && !hasOverlay {
-            let overlay = CachedTileOverlay()
+        if hw.isOfflineMapActive {
+            let overlay: CachedTileOverlay
+            if !hw.selectedMBTilesPath.isEmpty {
+                let mbtilesURL = URL(fileURLWithPath: hw.selectedMBTilesPath)
+                overlay = CachedTileOverlay(mbtilesURL: mbtilesURL)
+            } else {
+                overlay = CachedTileOverlay()
+            }
             overlay.canReplaceMapContent = true
             mapView.addOverlay(overlay, level: .aboveRoads)
-        } else if !hw.isOfflineMapActive && hasOverlay {
-            let overlays = mapView.overlays.filter { $0 is CachedTileOverlay }
-            mapView.removeOverlays(overlays)
         }
     }
 
     private func updateOverlays(_ mapView: MKMapView) {
-        // Bereinigung alter Polylines
         let existingPolylines = mapView.overlays.filter { $0 is MKPolyline && !($0 is CachedTileOverlay) }
         mapView.removeOverlays(existingPolylines)
         
-        // 1. MAPEM - Fahrspuren einzeichnen
+        // 1. MAPEM
         for mapGeo in hw.mapGeometries.values {
             guard mapGeo.laneCoordinates.count >= 2 else { continue }
             let polyline = MKPolyline(coordinates: mapGeo.laneCoordinates, count: mapGeo.laneCoordinates.count)
@@ -719,7 +876,7 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addOverlay(polyline, level: .aboveRoads)
         }
         
-        // 2. MCM - Fahrt-Trajektorien einzeichnen
+        // 2. MCM
         for maneuver in hw.maneuvers.values {
             guard maneuver.trajectoryPoints.count >= 2 else { continue }
             let polyline = MKPolyline(coordinates: maneuver.trajectoryPoints, count: maneuver.trajectoryPoints.count)
@@ -727,7 +884,7 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addOverlay(polyline, level: .aboveRoads)
         }
         
-        // 3. DYNAMISCHE SPATEM SPUREN (Aus tshark Live-Datenstrom)
+        // 3. DYNAMISCHE SPATEM SPUREN
         for packet in livePackets where packet.messageType == .SPATEM {
             let phase = packet.specificPayload["phase"] as? String ?? "red"
             let polyline = MKPolyline(coordinates: [
@@ -740,10 +897,8 @@ struct CITSMapView: NSViewRepresentable {
     }
     
     private func updateAnnotations(_ mapView: MKMapView) {
-        // Lösche alle Annotationen vor dem Neuzeichnen, um Drift zu verhindern
         mapView.removeAnnotations(mapView.annotations)
         
-        // Eigene GPS-Position einzeichnen
         if let myLoc = hw.myLocation {
             let annotation = MKPointAnnotation()
             annotation.coordinate = myLoc
@@ -751,7 +906,6 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addAnnotation(annotation)
         }
         
-        // CAM Fahrzeuge
         for vehicle in hw.vehicles.values {
             let annotation = MKPointAnnotation()
             annotation.coordinate = vehicle.coordinate
@@ -759,7 +913,6 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addAnnotation(annotation)
         }
         
-        // SPATEM Ampelanlagen
         for light in hw.trafficLights.values {
             let annotation = MKPointAnnotation()
             annotation.coordinate = light.coordinate
@@ -768,7 +921,6 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addAnnotation(annotation)
         }
         
-        // DENM Gefahrenzonen
         for zone in hw.dangerZones.values {
             let annotation = MKPointAnnotation()
             annotation.coordinate = zone.coordinate
@@ -777,7 +929,6 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addAnnotation(annotation)
         }
 
-        // IVIM Digitale Straßenschilder
         for sign in hw.virtualSigns.values {
             let annotation = MKPointAnnotation()
             annotation.coordinate = sign.coordinate
@@ -786,7 +937,6 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addAnnotation(annotation)
         }
 
-        // CPM Radar/LiDAR-Fremdobjekte
         for obj in hw.collectiveObjects.values {
             let annotation = MKPointAnnotation()
             annotation.coordinate = obj.coordinate
@@ -795,7 +945,6 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addAnnotation(annotation)
         }
 
-        // SRM Prioritätsanfragen
         for req in hw.signalRequests.values {
             let annotation = MKPointAnnotation()
             annotation.coordinate = req.coordinate
@@ -804,7 +953,6 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addAnnotation(annotation)
         }
 
-        // SSM Bestätigungen
         for status in hw.signalStatuses.values {
             let annotation = MKPointAnnotation()
             annotation.coordinate = status.coordinate
@@ -813,7 +961,6 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addAnnotation(annotation)
         }
 
-        // MAPEM Kreuzungszentren
         for mapGeo in hw.mapGeometries.values {
             let annotation = MKPointAnnotation()
             annotation.coordinate = mapGeo.centerCoordinate
@@ -822,7 +969,6 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addAnnotation(annotation)
         }
 
-        // MCM Manöver-Startpunkte
         for maneuver in hw.maneuvers.values {
             guard let startPoint = maneuver.trajectoryPoints.first else { continue }
             let annotation = MKPointAnnotation()
@@ -832,7 +978,6 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addAnnotation(annotation)
         }
 
-        // RTCMEM Referenzstationen
         for rtk in hw.rtkCorrections.values {
             let annotation = MKPointAnnotation()
             annotation.coordinate = rtk.coordinate
@@ -841,14 +986,13 @@ struct CITSMapView: NSViewRepresentable {
             mapView.addAnnotation(annotation)
         }
         
-        // LIVE TSHARK C-ITS ANNOTATIONEN RENDERN
         for packet in livePackets {
             let annotation = CITSPacketAnnotation()
             annotation.coordinate = packet.coordinates
             annotation.packet = packet
             annotation.customIconType = packet.messageType
             annotation.title = "\(packet.messageType.rawValue) (Station \(packet.stationID))"
-            annotation.subtitle = "Klicke für detaillierte tshark JSON Analyse"
+            annotation.subtitle = String(format: "%@ · %.5f, %.5f", packet.messageType.rawValue, packet.coordinates.latitude, packet.coordinates.longitude)
             mapView.addAnnotation(annotation)
         }
     }
@@ -892,7 +1036,6 @@ struct CITSMapView: NSViewRepresentable {
             return MKOverlayRenderer(overlay: overlay)
         }
         
-        // INTERAKTIVE SELEKTIONS-VERNETZUNG ZU SWIFTUI POPUP
         func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
             if let customAnnotation = view.annotation as? CITSPacketAnnotation,
                let packet = customAnnotation.packet {
@@ -911,7 +1054,6 @@ struct CITSMapView: NSViewRepresentable {
                 view?.annotation = annotation
             }
             
-            // Handelt es sich um ein dynamisches tshark-Paket?
             if let citsAnno = annotation as? CITSPacketAnnotation, let msgType = citsAnno.customIconType {
                 switch msgType {
                 case .CAM:
@@ -988,7 +1130,7 @@ struct CITSMapView: NSViewRepresentable {
     }
 }
 
-// --- DEBBUGING-FENSTER MIT EIGENER SEGMENTED-PICKER NAVIGATION ---
+// MARK: - DEBUGGING-FENSTER MIT EIGENER SEGMENTED-PICKER NAVIGATION
 struct DebugConsoleView: View {
     var hw: V2XHardwareManager
     @State private var selectedTab = 0
@@ -1057,6 +1199,37 @@ struct DebugConsoleView: View {
             case 0:
                 VStack(spacing: 0) {
                     VStack(alignment: .leading, spacing: 10) {
+                        Toggle("Automatischer Ablauf", isOn: .init(
+                            get: { hw.isAutoSimulationActive },
+                            set: { _ in hw.toggleAutoSimulation() }
+                        ))
+                        .font(.caption).bold()
+                        .toggleStyle(.switch)
+
+                        HStack(spacing: 8) {
+                            Button(action: {
+                                hw.simulateCAM()
+                                hw.simulateSPATEM()
+                                hw.addLog("[sim] Manuelle Signalsimulation aus der Debug-Zentrale ausgelöst.")
+                            }) {
+                                Label("Jetzt simulieren", systemImage: "bolt.horizontal.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button(action: {
+                                if hw.isAutoSimulationActive {
+                                    hw.toggleAutoSimulation()
+                                }
+                            }) {
+                                Label("Simulation stoppen", systemImage: "stop.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.red)
+                            .disabled(!hw.isAutoSimulationActive)
+                        }
+                        
                         Text("C-ITS SIGNAL-GENERATOR (HARDWARE-FREIE SIMULATION)").font(.caption).bold().foregroundColor(.secondary)
                         
                         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
@@ -1127,7 +1300,7 @@ struct DebugConsoleView: View {
                         .background(Color(NSColor.windowBackgroundColor))
                         
                         List(Array(hw.logs.enumerated()), id: \.offset) { _, log in
-                            Text(displayText(log))
+                            Text("[\(log.timestamp.formatted(.dateTime.hour().minute().second()))] \(log.text)")
                                 .font(.system(.caption2, design: .monospaced))
                                 .foregroundColor(.green)
                         }
@@ -1136,6 +1309,7 @@ struct DebugConsoleView: View {
                 }
                 
             case 1:
+                // MODIFIZIERTER REITER: V2X Modem (SLIP- & Sniffer-Stream im Putty-Stil)
                 VStack(spacing: 8) {
                     HStack {
                         Text("ESP32 CLI Command Terminal").font(.caption).bold().foregroundColor(.secondary)
@@ -1189,15 +1363,14 @@ struct DebugConsoleView: View {
                     ESPCommandInputView(hw: hw)
                     .padding(.horizontal)
 
-                    List(hw.espConsoleLog, id: \.id) { line in
-                        Text(displayText(line))
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundColor(displayText(line).contains("=>") ? .cyan : .green)
-                    }
-                    .background(.black)
+                    // Putty Terminal View für V2X Modem Befehlsverkehr und Sniffer-Pakete
+                    PuttyTerminalView(entries: v2xLogs, textColor: .green)
+                        .padding(.horizontal)
+                        .padding(.bottom, 8)
                 }
 
             case 2:
+                // MODIFIZIERTER REITER: GPS Empfänger (NMEA im Putty-Stil)
                 VStack(spacing: 0) {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -1218,15 +1391,13 @@ struct DebugConsoleView: View {
                     
                     Divider()
                     
-                    List(Array(gpsLogs.enumerated()), id: \.offset) { _, log in
-                        Text(displayText(log))
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundColor(.cyan)
-                    }
-                    .background(.black)
+                    // Putty Terminal View für GPS Rohdaten
+                    PuttyTerminalView(entries: gpsLogs, textColor: .cyan)
+                        .padding(8)
                 }
                 
             case 3:
+                // MODIFIZIERTER REITER: Netzwerk-Diagnose, Gateway & Simulationen (Putty-Stil)
                 VStack(spacing: 0) {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -1279,12 +1450,8 @@ struct DebugConsoleView: View {
                         .padding(.vertical, 8)
                         .background(Color(NSColor.windowBackgroundColor))
                         
-                        List(Array(simLogs.enumerated()), id: \.offset) { _, log in
-                            Text(displayText(log))
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundColor(.purple)
-                        }
-                        .background(.black)
+                        PuttyTerminalView(entries: simLogs, textColor: .purple)
+                            .padding(8)
                     }
                 }
                 
@@ -1295,16 +1462,23 @@ struct DebugConsoleView: View {
         .frame(minWidth: 720, minHeight: 520)
     }
     
-    private func displayText(_ entry: LogEntry) -> String {
-        return entry.text
+    // MARK: - FILTERUNG DER ROHDATENSTRÖME FÜR DIE TERMINALS
+    /// Filtert Befehlseingaben, ESP-Antworten und dekodierten Sniffer-Verkehr für das Modem-Terminal
+    private var v2xLogs: [LogEntry] {
+        (hw.espConsoleLog + hw.debugRawPackets.filter { $0.text.contains("[V2X") })
+            .sorted(by: { $0.timestamp < $1.timestamp })
     }
-    
-    private var v2xLogs: [LogEntry] { hw.debugRawPackets.filter { displayText($0).contains("[V2X]") } }
-    private var gpsLogs: [LogEntry] { hw.debugRawPackets.filter { displayText($0).contains("[GPS]") } }
-    private var simLogs: [LogEntry] { hw.debugRawPackets.filter { displayText($0).contains("[SIM") || displayText($0).contains("[NET") } }
+    /// Filtert GPS-NMEA-Datensätze und GPS-Bus-Fehler
+    private var gpsLogs: [LogEntry] { 
+        hw.debugRawPackets.filter { $0.text.contains("[GPS") } 
+    }
+    /// Filtert Simulationsströme, Wireshark tshark Logs und Netzwerkmeldungen
+    private var simLogs: [LogEntry] { 
+        hw.debugRawPackets.filter { $0.text.contains("[SIM") || $0.text.contains("[NET") } 
+    }
 }
 
-// Hilfs-View für text input state in Switch Cases
+// MARK: - ESPCommandInputView
 struct ESPCommandInputView: View {
     let hw: V2XHardwareManager
     @State private var inputCommand = ""
