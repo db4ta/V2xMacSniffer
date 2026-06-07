@@ -168,3 +168,172 @@ public enum JSONUtils {
         return str + "\n"
     }
 }
+/// MARK: - ASN.1 UPER Bit-Reader (unaligned, big-endian bit order)
+public struct BitReader {
+    private let bytes: [UInt8]
+    private(set) public var bitIndex: Int = 0 // absolute bit position from start
+
+    public init(data: Data) {
+        self.bytes = Array(data)
+        self.bitIndex = 0
+    }
+
+    public var bitsRemaining: Int { bytes.count * 8 - bitIndex }
+    public var isAtEnd: Bool { bitsRemaining <= 0 }
+
+    /// Aligns to next byte boundary (if currently not aligned)
+    public mutating func alignToByte() {
+        let rem = bitIndex & 7
+        if rem != 0 { bitIndex += (8 - rem) }
+    }
+
+    /// Reads a single bit (MSB-first within each byte). Returns nil if no bits remain.
+    public mutating func readBit() -> UInt8? {
+        guard bitIndex < bytes.count * 8 else { return nil }
+        let byteOffset = bitIndex >> 3
+        let bitOffsetInByte = 7 - (bitIndex & 7) // MSB-first
+        let b = bytes[byteOffset]
+        let bit = (b >> bitOffsetInByte) & 0x01
+        bitIndex += 1
+        return bit
+    }
+
+    /// Reads `count` bits as an unsigned value (up to 64). Returns nil on overflow/end.
+    public mutating func readBits(_ count: Int) -> UInt64? {
+        precondition(count >= 0 && count <= 64, "readBits count out of range")
+        if count == 0 { return 0 }
+        guard bitsRemaining >= count else { return nil }
+        var value: UInt64 = 0
+        for _ in 0..<count {
+            guard let bit = readBit() else { return nil }
+            value = (value << 1) | UInt64(bit)
+        }
+        return value
+    }
+
+    /// Reads an unsigned integer with exactly `bitCount` bits and returns as UInt.
+    public mutating func readUnsigned(_ bitCount: Int) -> UInt? {
+        guard let v = readBits(bitCount) else { return nil }
+        return UInt(v)
+    }
+
+    /// Reads a signed two's complement integer occupying exactly `bitCount` bits.
+    /// Example: for ETSI DE_Latitude/Longitude use bitCount=32 and convert to Int32.
+    public mutating func readSigned(_ bitCount: Int) -> Int64? {
+        precondition(bitCount >= 1 && bitCount <= 64, "readSigned bitCount out of range")
+        guard let raw = readBits(bitCount) else { return nil }
+        // If top bit (sign) is set, extend with ones.
+        let signMask: UInt64 = 1 << (bitCount - 1)
+        if (raw & signMask) != 0 {
+            // Negative number: sign-extend into 64 bits
+            let extensionMask: UInt64 = ~((1 << bitCount) - 1)
+            let extended = raw | extensionMask
+            return Int64(bitPattern: extended)
+        } else {
+            return Int64(raw)
+        }
+    }
+
+    /// Reads exactly `byteCount` bytes, regardless of current bit alignment (bit-accurate copy).
+    /// Useful when UPER encodes octet strings that may not be byte-aligned (rare but possible via length + bits).
+    public mutating func readBytes(_ byteCount: Int) -> Data? {
+        guard byteCount >= 0 else { return nil }
+        if byteCount == 0 { return Data() }
+        // If already byte-aligned, we can slice fast.
+        if (bitIndex & 7) == 0 {
+            let start = bitIndex >> 3
+            let end = start + byteCount
+            guard end <= bytes.count else { return nil }
+            bitIndex += byteCount * 8
+            return Data(bytes[start..<end])
+        }
+        // Otherwise, assemble byte-by-byte via readBits(8)
+        var out = Data(capacity: byteCount)
+        for _ in 0..<byteCount {
+            guard let v = readBits(8) else { return nil }
+            out.append(UInt8(v & 0xFF))
+        }
+        return out
+    }
+}
+
+// MARK: - ETSI / C-ITS Decoding Helpers
+public enum CITSDecoding {
+    /// Reads a presence map of `count` bits and returns them as a boolean array (MSB-first within the sequence).
+    public static func readPresenceMap(_ reader: inout BitReader, count: Int) -> [Bool]? {
+        guard count >= 0 else { return nil }
+        if count == 0 { return [] }
+        var flags: [Bool] = []
+        flags.reserveCapacity(count)
+        for _ in 0..<count {
+            guard let b = reader.readBit() else { return nil }
+            flags.append(b != 0)
+        }
+        return flags
+    }
+
+    /// Decodes ETSI DE_Latitude (32-bit signed, unit = 1e-7 degree). Returns degrees as Double.
+    public static func decodeLatitude(_ reader: inout BitReader) -> Double? {
+        guard let v = reader.readSigned(32) else { return nil }
+        // Clamp to ETSI range if needed: [-900000000 .. 900000001] (optional)
+        let int32 = Int32(truncatingIfNeeded: v)
+        return Double(int32) / 10_000_000.0
+    }
+
+    /// Decodes ETSI DE_Longitude (32-bit signed, unit = 1e-7 degree). Returns degrees as Double.
+    public static func decodeLongitude(_ reader: inout BitReader) -> Double? {
+        guard let v = reader.readSigned(32) else { return nil }
+        let int32 = Int32(truncatingIfNeeded: v)
+        return Double(int32) / 10_000_000.0
+    }
+
+    /// Decodes an unsigned integer with a given bit width and scale factor.
+    /// Example: speed (e.g., 16 bits) with scale to m/s or km/h depending on spec.
+    public static func decodeUnsignedScaled(_ reader: inout BitReader, bits: Int, scale: Double) -> Double? {
+        guard let v = reader.readBits(bits) else { return nil }
+        return Double(v) * scale
+    }
+
+    /// Decodes a signed integer with a given bit width and scale factor.
+    public static func decodeSignedScaled(_ reader: inout BitReader, bits: Int, scale: Double) -> Double? {
+        guard let v = reader.readSigned(bits) else { return nil }
+        return Double(v) * scale
+    }
+}
+
+// MARK: - Sanity helpers for angles and ranges
+public enum GeoSanity {
+    /// Normalizes latitude to [-90, 90]. If value is out of range, returns nil to indicate corrupted parse.
+    public static func normalizeLatitude(_ lat: Double) -> Double? {
+        guard lat >= -90.0, lat <= 90.0 else { return nil }
+        return lat
+    }
+
+    /// Normalizes longitude to [-180, 180]. If out of range, wraps to [-180, 180].
+    public static func wrapLongitude(_ lon: Double) -> Double {
+        var x = lon
+        while x < -180.0 { x += 360.0 }
+        while x > 180.0 { x -= 360.0 }
+        return x
+    }
+}
+
+// MARK: - Example parse snippet (documentation only)
+/*
+ Usage example inside your CAM/DENM/SPATEM/MAPEM decoders:
+
+ var reader = BitReader(data: payloadData)
+ // Read optional fields presence bits first, as defined by the specific ASN.1 spec.
+ if let presence = CITSDecoding.readPresenceMap(&reader, count: N) {
+     // presence[i] tells whether the next field is present; only read it if true.
+ }
+ // Latitude/Longitude (32-bit signed, 1e-7 degrees):
+ if let lat = CITSDecoding.decodeLatitude(&reader), let normLat = GeoSanity.normalizeLatitude(lat) {
+     // use normLat
+ }
+ if let lon = CITSDecoding.decodeLongitude(&reader) {
+     let wrappedLon = GeoSanity.wrapLongitude(lon)
+     // use wrappedLon
+ }
+*/
+
