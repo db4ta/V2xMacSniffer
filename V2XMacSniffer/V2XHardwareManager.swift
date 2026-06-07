@@ -150,7 +150,6 @@ class MBTilesDatabase {
 }
 
 // MARK: - CachedTileOverlay für MapKit Offline-Caching & MBTiles Support
-/// Verwaltet das Laden und Zwischenspeichern von Kartenkacheln. Unterstützt lokalen Dateicache sowie direkten MBTiles-Import.
 class CachedTileOverlay: MKTileOverlay {
     let cacheDirectory: URL
     var mbtilesDB: MBTilesDatabase?
@@ -166,7 +165,6 @@ class CachedTileOverlay: MKTileOverlay {
         super.init(urlTemplate: URLTemplate)
     }
     
-    /// Liefert den lokalen Dateipfad für eine spezifische Kachel.
     func cachePath(for path: MKTileOverlayPath) -> URL {
         return cacheDirectory
             .appendingPathComponent("\(path.z)")
@@ -213,7 +211,7 @@ class CachedTileOverlay: MKTileOverlay {
 
 // MARK: - C-ITS ERWEITERTE MODELLE (Codable & Equatable)
 
-// MARK: - MAPEM (Map Data) - Kreuzungsgeometrien & Fahrspuren
+// MARK: - MAPEM (Map Data)
 struct V2XMapGeometry: Identifiable, Codable, Equatable {
     let id: Int
     var name: String
@@ -242,7 +240,7 @@ struct V2XMapGeometry: Identifiable, Codable, Equatable {
         laneCoordinates = rawLanes.map { CLLocationCoordinate2D(latitude: $0[0], longitude: $0[1]) }
     }
 
-    func encode(to encoder: Error) throws { } // Wird vom Framework nicht verwendet, zur Sicherheit leer implementiert
+    func encode(to encoder: Error) throws { }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -260,7 +258,7 @@ struct V2XMapGeometry: Identifiable, Codable, Equatable {
     }
 }
 
-// MARK: - IVIM (Infrastructural Virtual Signage) - Straßenschilder & Tempolimits
+// MARK: - IVIM (Infrastructural Virtual Signage)
 struct V2XVirtualSign: Identifiable, Codable, Equatable {
     let id: Int
     var type: String
@@ -301,7 +299,7 @@ struct V2XVirtualSign: Identifiable, Codable, Equatable {
     }
 }
 
-// MARK: - CPM (Collective Perception Message) - LiDAR/Radar Fremdobjekte
+// MARK: - CPM (Collective Perception Message)
 struct V2XCollectiveObject: Identifiable, Codable, Equatable {
     let id: Int
     var sensorType: String
@@ -350,7 +348,7 @@ struct V2XCollectiveObject: Identifiable, Codable, Equatable {
     }
 }
 
-// MARK: - SRM (Signal Request Message) - Prioritätsanfragen von Einsatzkräften
+// MARK: - SRM (Signal Request Message)
 struct V2XSignalRequest: Identifiable, Codable, Equatable {
     let id: Int
     var requesterType: String
@@ -391,7 +389,7 @@ struct V2XSignalRequest: Identifiable, Codable, Equatable {
     }
 }
 
-// MARK: - SSM (Signal Status Message) - Ampel-Bestätigung für Priorisierung
+// MARK: - SSM (Signal Status Message)
 struct V2XSignalStatus: Identifiable, Codable, Equatable {
     let id: Int
     var intersectionID: Int
@@ -432,7 +430,7 @@ struct V2XSignalStatus: Identifiable, Codable, Equatable {
     }
 }
 
-// MARK: - MCM (Maneuver Coordination Message) - Trajektorienabsprachen
+// MARK: - MCM (Maneuver Coordination Message)
 struct V2XManeuver: Identifiable, Codable, Equatable {
     let id: Int
     var vehicleID: Int
@@ -474,7 +472,7 @@ struct V2XManeuver: Identifiable, Codable, Equatable {
     }
 }
 
-// MARK: - RTCMEM (RTCM Correction Messages) - GPS RTK-Korrekturen
+// MARK: - RTCMEM (RTCM Correction Messages)
 struct V2XRTKCorrection: Identifiable, Codable, Equatable {
     let id: Int
     var baseStationID: Int
@@ -521,13 +519,20 @@ struct V2XRTKCorrection: Identifiable, Codable, Equatable {
 
 // MARK: - V2XHardwareManager Implementation
 @Observable
-class V2XHardwareManager {
+class V2XHardwareManager: NSObject {
     // Aktive Status-Flags
     var v2xPortOpen = false
     var isV2XManuallyConnected = false
     var gpsPortOpen = false
     var isGPSManuallyConnected = false
     var serverRunning = false
+    
+    // Automatisches Kartennachführen (Zentrierung auf eigene Position)
+    var isMapTrackingActive = true
+    
+    // Durchsatz-Raten für die Key-Value-Coding-Schnittstelle
+    @objc var v2xRxRateBps: Double = 0.0
+    @objc var gpsRxRateBps: Double = 0.0
     
     // C-ITS Geodaten-Zustände (Strict Main-Thread Mutated)
     var vehicles: [Int: V2XVehicle] = [:]
@@ -549,9 +554,9 @@ class V2XHardwareManager {
     let v2xBaudOptions = ["9600", "115200", "460800", "921600"]
     
     var selectedGPSPort = ""
-    var selectedGPSBaud = "9600"
+    var selectedGPSBaud = "Auto"
     var lockedGPSBaud = "9600"
-    let gpsBaudOptions = ["4800", "9600", "19200", "38400", "57600", "115200"]
+    let gpsBaudOptions = ["Auto", "4800", "9600", "19200", "38400", "57600", "115200"]
     
     var availablePorts: [String] = []
     
@@ -609,10 +614,11 @@ class V2XHardwareManager {
     var gpsPacketCache: [Data] = []
     var networkPacketCache: [Data] = []
     
-    // --- SIMULATIONSEIGENSCHAFTEN (ZUSAMMENFÜHRUNG) ---
+    // --- SIMULATIONSEIGENSCHAFTEN ---
     var isAutoSimulationActive = false
     var simulationIntervalSeconds: Double = 2.0
     private var simulationTimer: Timer?
+    private var rateTimer: Timer?
     
     // Private Handles und Sockets
     private var v2xHandle: FileHandle?
@@ -624,7 +630,8 @@ class V2XHardwareManager {
     private var shouldRead = false
     private var downloadTask: Task<Void, Never>? = nil
     
-    init() {
+    override init() {
+        super.init()
         if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
             self.logDirectoryPathString = docs.path
             self.csvFilePathString = docs.appendingPathComponent("v2x_capture.csv").path
@@ -632,6 +639,26 @@ class V2XHardwareManager {
         }
         scanPorts()
         updateCacheSizeString()
+        startRateTimer()
+    }
+    
+    // MARK: - Datenübertragungs-Ratenrechner (1Hz Frequenz)
+    private func startRateTimer() {
+        var lastV2XBytes = 0
+        var lastGPSBytes = 0
+        
+        rateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let currentV2X = self.totalV2XBytesRx
+            let currentGPS = self.totalGPSBytesRx
+            
+            // Ermittle die Differenz im Datenstrom pro Sekunde
+            self.v2xRxRateBps = Double(currentV2X - lastV2XBytes)
+            self.gpsRxRateBps = Double(currentGPS - lastGPSBytes)
+            
+            lastV2XBytes = currentV2X
+            lastGPSBytes = currentGPS
+        }
     }
     
     // MARK: - Logger Hilfskonstrukte (Threadsicher)
@@ -706,7 +733,6 @@ class V2XHardwareManager {
                             continue
                         }
                         
-                        // Zähler-Inkremente threadsicher auf Main Queue verlegen
                         let incomingBytes = data.count
                         DispatchQueue.main.async { [weak self] in
                             self?.totalV2XBytesRx += incomingBytes
@@ -742,18 +768,13 @@ class V2XHardwareManager {
     }
     
     // MARK: - DUAL-FORMAT KOORDINATEN DETEKTION & ENDIANNESS-RETTUNG
-    /// Extrahiert Koordinatenwerte sicher aus einem 4-Byte-Subsegment.
-    /// Unterstützt sowohl IEEE-754 Single Floats als auch klassische Int32-Werte (dividiert durch 10^7) mit Endianness-Absicherung.
     private func parseCoordinateField(from data: Data, offset: Int) -> Double? {
         guard data.count >= offset + 4 else { return nil }
         let sub = data.subdata(in: offset..<offset+4)
         
-        // 1. IEEE-754 Float Test (Little Endian und Big Endian)
         let floatLE = sub.withUnsafeBytes { $0.load(as: Float.self) }
         let floatBE = Data(sub.reversed()).withUnsafeBytes { $0.load(as: Float.self) }
         
-        // Eine valide Geokoordinate liegt realistischerweise zwischen -180.0 und 180.0 Grad.
-        // Wir filtern Null Island (nahe 0.0) und unendliche/NaN-Fehler aus.
         if floatLE.isFinite && abs(floatLE) > 0.01 && abs(floatLE) <= 180.0 {
             return Double(floatLE)
         }
@@ -761,14 +782,12 @@ class V2XHardwareManager {
             return Double(floatBE)
         }
         
-        // 2. Fallback auf Standard ETSI Int32 (Faktor 1/10^7)
         let intLE = sub.withUnsafeBytes { $0.load(as: Int32.self) }
         let intBE = intLE.byteSwapped
         
         let degLE = Double(intLE) / 10_000_000.0
         let degBE = Double(intBE) / 10_000_000.0
         
-        // Plausibilitätsprüfung für Europa / Global
         if abs(degBE) > 0.0001 && abs(degBE) <= 180.0 {
             return degBE
         }
@@ -776,20 +795,17 @@ class V2XHardwareManager {
             return degLE
         }
         
-        return degLE // Ultimativer Fallback
+        return degLE
     }
     
-    /// Extrahiert Geschwindigkeitsdaten mit Absicherung gegen Overflow-Übertragungsartefakte
     private func parseSpeedField(from data: Data, offset: Int, isBigEndian: Bool) -> Double {
         guard data.count >= offset + 2 else { return 0.0 }
         let rawLE = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self) }
         let rawBE = rawLE.byteSwapped
         let raw = isBigEndian ? rawBE : rawLE
         
-        // Standard ETSI CAM Geschwindigkeit ist in 0.01 m/s. Wir begrenzen auf physikalisch sinnvolle 250 km/h.
         let speedKMH = (Double(raw) / 100.0) * 3.6
         if speedKMH > 250.0 {
-            // Falls unplausibel hoch, könnte es sich um 1 km/h Auflösung handeln
             let alternativeSpeed = Double(raw)
             return alternativeSpeed <= 250.0 ? alternativeSpeed : 0.0
         }
@@ -801,7 +817,6 @@ class V2XHardwareManager {
         
         let ts = Int64(Date().timeIntervalSince1970 * 1000)
         
-        // JSON-Schnittstelle prüfen
         if payload[0] == 0x7B {
             if let decodedStr = String(data: payload, encoding: .utf8) {
                 addDebugPacketLog("[V2X JSON] \(decodedStr)")
@@ -814,14 +829,11 @@ class V2XHardwareManager {
         
         let typeByte = payload[0]
         
-        // Dynamische Endianness-Erkennung anhand der Latitude
         let rawLatBytes = payload.subdata(in: 5..<9)
         let latLE = rawLatBytes.withUnsafeBytes { $0.load(as: Int32.self) }
         let latBE = latLE.byteSwapped
-        let degLE = Double(latLE) / 10_000_000.0
         let degBE = Double(latBE) / 10_000_000.0
         
-        // Befinden wir uns im europäischen Koordinatenraum?
         let isBigEndian = (degBE > 35.0 && degBE < 72.0)
         
         func readUInt32(offset: Int) -> UInt32? {
@@ -847,7 +859,6 @@ class V2XHardwareManager {
         
         guard lat != 0.0 && lon != 0.0 else { return }
         
-        // Alle UI- und Observable-Schreibzugriffe zur Vermeidung von __pthread_kill auf die Main Queue dispatchen
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             
@@ -1022,7 +1033,6 @@ class V2XHardwareManager {
         
         guard lat != 0.0 && lon != 0.0 else { return }
         
-        // Zuweisungen und UI-Triggers threadsicher auf den Main Thread schicken
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             
@@ -1131,54 +1141,114 @@ class V2XHardwareManager {
             addLog("[-] GPS-Port-Verbindung fehlgeschlagen: Kein Port ausgewählt.")
             return
         }
-        configurePort(path: selectedGPSPort, baud: selectedGPSBaud)
-        if let handle = FileHandle(forReadingAtPath: selectedGPSPort) {
-            self.gpsHandle = handle
-            self.gpsPortOpen = true
-            self.isGPSManuallyConnected = true
-            self.lockedGPSBaud = selectedGPSBaud
-            self.shouldRead = true
-            addLog("[+] GPS USB geöffnet: \(selectedGPSPort) @ \(selectedGPSBaud) Baud")
+        
+        let baudsToTry = selectedGPSBaud == "Auto" ? ["9600", "4800", "115200", "38400", "19200", "57600"] : [selectedGPSBaud]
+        
+        self.gpsPortOpen = true
+        self.isGPSManuallyConnected = true
+        self.shouldRead = true
+        
+        Thread.detachNewThread { [weak self] in
+            guard let self = self else { return }
             
-            Thread.detachNewThread { [weak self] in
-                var buffer = ""
-                while self?.shouldRead == true {
-                    do {
-                        guard let data = try handle.read(upToCount: 128) else {
-                            try Thread.sleep(forTimeInterval: 0.05)
-                            continue
-                        }
-                        if data.isEmpty {
-                            try Thread.sleep(forTimeInterval: 0.05)
-                            continue
-                        }
-                        
-                        // GPS-Zähler und Cache-Zuweisung threadsicher auf die Main Queue dispatchen
-                        let incomingBytes = data.count
-                        DispatchQueue.main.async { [weak self] in
-                            self?.totalGPSBytesRx += incomingBytes
-                            self?.gpsPacketCache.append(data)
-                        }
-                        
-                        if let chunk = String(data: data, encoding: .utf8) {
-                            buffer += chunk
-                            while let endIdx = buffer.firstIndex(of: "\n") {
-                                let line = String(buffer[..<endIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
-                                buffer.removeSubrange(...endIdx)
-                                if line.hasPrefix("$GPRMC") {
-                                    self?.parseNMEA(line)
+            var activeBaud = "9600"
+            var openedHandle: FileHandle? = nil
+            
+            // Loop durch alle möglichen Baudraten (Auto-Baud Scanner)
+            for baud in baudsToTry {
+                guard self.shouldRead else { break }
+                self.addLog("[i] Teste GPS Baudrate: \(baud)...")
+                self.configurePort(path: self.selectedGPSPort, baud: baud)
+                
+                if let handle = FileHandle(forReadingAtPath: self.selectedGPSPort) {
+                    var testBuffer = Data()
+                    let startTime = Date()
+                    var foundNMEA = false
+                    
+                    // Lese für maximal 1,5 Sekunden pro Geschwindigkeit, um nach dem '$'-Symbol zu suchen
+                    while Date().timeIntervalSince(startTime) < 1.5 {
+                        if let data = try? handle.read(upToCount: 256), !data.isEmpty {
+                            testBuffer.append(data)
+                            if let str = String(data: testBuffer, encoding: .ascii) {
+                                // Suche robust nach gültigen NMEA-Tags, um Fehldetektionen durch Rauschen auszuschließen
+                                if str.contains("$GP") || str.contains("$GN") || str.contains("$GL") || str.contains("$BD") {
+                                    foundNMEA = true
+                                    break
                                 }
                             }
                         }
-                    } catch {
-                        self?.addLog("[-] GPS Lese-Fehler: \(error.localizedDescription)")
-                        self?.addDebugPacketLog("[GPS ERROR] \(error.localizedDescription)")
-                        try? Thread.sleep(forTimeInterval: 0.5)
+                        try? Thread.sleep(forTimeInterval: 0.1)
+                    }
+                    
+                    if foundNMEA || baudsToTry.count == 1 {
+                        activeBaud = baud
+                        openedHandle = handle
+                        self.addLog("[+] GPS NMEA Signal erfolgreich erkannt bei \(baud) Baud!")
+                        DispatchQueue.main.async {
+                            self.lockedGPSBaud = baud
+                        }
+                        break
+                    } else {
+                        try? handle.close()
                     }
                 }
             }
-        } else {
-            addLog("[-] GPS-Port konnte nicht geöffnet werden.")
+            
+            guard let handle = openedHandle else {
+                self.addLog("[-] GPS-Empfänger konnte auf \(self.selectedGPSPort) nicht erfolgreich initialisiert werden.")
+                DispatchQueue.main.async {
+                    self.gpsPortOpen = false
+                    self.isGPSManuallyConnected = false
+                }
+                return
+            }
+            
+            self.gpsHandle = handle
+            var buffer = ""
+            
+            while self.shouldRead {
+                do {
+                    guard let data = try handle.read(upToCount: 512) else {
+                        try Thread.sleep(forTimeInterval: 0.05)
+                        continue
+                    }
+                    if data.isEmpty {
+                        try Thread.sleep(forTimeInterval: 0.05)
+                        continue
+                    }
+                    
+                    let incomingBytes = data.count
+                    DispatchQueue.main.async {
+                        self.totalGPSBytesRx += incomingBytes
+                        self.gpsPacketCache.append(data)
+                    }
+                    
+                    if let chunk = String(data: data, encoding: .ascii) {
+                        buffer += chunk
+                        var lines = buffer.components(separatedBy: "\n")
+                        if !lines.isEmpty {
+                            // Letzte unvollständige Zeile im Buffer halten
+                            buffer = lines.removeLast()
+                            for rawLine in lines {
+                                let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if !line.isEmpty {
+                                    // Alle empfangenen Zeilen an das Debug-Terminal ausgeben
+                                    self.addDebugPacketLog("[GPS] \(line)")
+                                    
+                                    // RMC Sätze identifizieren ($GPRMC, $GNRMC, $GLRMC etc.)
+                                    if line.contains("RMC") {
+                                        self.parseNMEA(line)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    self.addLog("[-] GPS Lese-Fehler: \(error.localizedDescription)")
+                    self.addDebugPacketLog("[GPS ERROR] \(error.localizedDescription)")
+                    try? Thread.sleep(forTimeInterval: 0.5)
+                }
+            }
         }
     }
     
@@ -1191,8 +1261,10 @@ class V2XHardwareManager {
     }
     
     private func parseNMEA(_ line: String) {
-        addDebugPacketLog("[GPS] \(line)")
-        let p = line.components(separatedBy: ",")
+        guard let startIdx = line.firstIndex(of: "$") else { return }
+        let cleanLine = String(line[startIdx...])
+        let p = cleanLine.components(separatedBy: ",")
+        
         if p.count > 6, p[2] == "A" {
             guard let rLat = Double(p[3]), let rLon = Double(p[5]) else { return }
             let lat = convertNMEA(rLat, dir: p[4])
@@ -1302,7 +1374,6 @@ class V2XHardwareManager {
         if let line = JSONUtils.encodeLine(msgType: type, payload: payload),
            let frame = line.data(using: .utf8) {
             
-            // Threadsicher dem globalen Cache hinzufügen
             DispatchQueue.main.async { [weak self] in
                 self?.networkPacketCache.append(frame)
             }
@@ -1636,7 +1707,6 @@ class V2XHardwareManager {
     }
     
     // MARK: - Karten-Cache-Anzeige (ASYNCHRON & ABSTURZSICHER BERECHNET)
-    /// Berechnet die belegte SSD-Größe des Ordners "MapTiles" auf einer globalen Hintergrund-Queue.
     func updateCacheSizeString() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let fm = FileManager.default
@@ -2011,6 +2081,8 @@ class V2XHardwareManager {
         shouldRead = false
         simulationTimer?.invalidate()
         simulationTimer = nil
+        rateTimer?.invalidate()
+        rateTimer = nil
         isAutoSimulationActive = false
         disconnectV2X()
         disconnectGPS()
@@ -2057,7 +2129,11 @@ class V2XAnnotation: NSObject, MKAnnotation {
 // MARK: - V2XMapView (Brücke zwischen MKMapView und SwiftUI)
 struct V2XMapView: NSViewRepresentable {
     @Bindable var hardwareManager: V2XHardwareManager
-    @Binding var selectedObject: SelectedV2XObject?
+    @Binding var selectedObject: SelectedObjectWrapper?
+    
+    struct SelectedObjectWrapper {
+        let value: SelectedV2XObject
+    }
     
     func makeNSView(context: Context) -> MKMapView {
         let mapView = MKMapView()
@@ -2129,9 +2205,16 @@ struct V2XMapView: NSViewRepresentable {
         
         nsView.addAnnotations(newAnnotations)
         
-        if let myLoc = hardwareManager.myLocation, nsView.centerCoordinate.latitude == 0.0 {
-            let region = MKCoordinateRegion(center: myLoc, latitudinalMeters: 1000, longitudinalMeters: 1000)
-            nsView.setRegion(region, animated: true)
+        // Kartennachführung (Auto-Centering & Following)
+        if hardwareManager.isMapTrackingActive, let myLoc = hardwareManager.myLocation {
+            let currentRegion = nsView.region
+            let delta = 0.005
+            if abs(currentRegion.center.latitude - myLoc.latitude) > delta || abs(currentRegion.center.longitude - myLoc.longitude) > delta {
+                let region = MKCoordinateRegion(center: myLoc, latitudinalMeters: 500, longitudinalMeters: 500)
+                nsView.setRegion(region, animated: true)
+            } else {
+                nsView.setCenter(myLoc, animated: true)
+            }
         }
     }
     
@@ -2210,7 +2293,7 @@ struct V2XMapView: NSViewRepresentable {
         func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
             if let v2xAnn = view.annotation as? V2XAnnotation {
                 DispatchQueue.main.async {
-                    self.parent.selectedObject = v2xAnn.object
+                    self.parent.selectedObject = SelectedObjectWrapper(value: v2xAnn.object)
                 }
             }
         }
@@ -2226,7 +2309,7 @@ struct V2XMapView: NSViewRepresentable {
 // MARK: - V2XMapViewContainer mit HUD Panel
 struct V2XMapViewContainer: View {
     @Bindable var hardwareManager: V2XHardwareManager
-    @State private var selectedObject: SelectedV2XObject? = nil
+    @State private var selectedObject: V2XMapView.SelectedObjectWrapper? = nil
     
     var body: some View {
         ZStack {
@@ -2241,6 +2324,11 @@ struct V2XMapViewContainer: View {
                             .foregroundColor(.white)
                         
                         Toggle("Offline-Modus aktiv", isOn: $hardwareManager.isOfflineMapActive)
+                            .font(.caption)
+                            .toggleStyle(.checkbox)
+                        
+                        // Toggle für optionale Zentrierung und Nachführung
+                        Toggle("Automatisch nachführen (GPS)", isOn: $hardwareManager.isMapTrackingActive)
                             .font(.caption)
                             .toggleStyle(.checkbox)
                         
@@ -2290,7 +2378,7 @@ struct V2XMapViewContainer: View {
                         Spacer()
                         HStack {
                             Spacer()
-                            V2XInspectorCard(selection: selected) {
+                            V2XInspectorCard(selection: selected.value) {
                                 selectedObject = nil
                             }
                             .frame(width: 320)
