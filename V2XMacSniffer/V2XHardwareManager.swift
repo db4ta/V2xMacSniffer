@@ -530,6 +530,9 @@ class V2XHardwareManager: NSObject {
     // Automatisches Kartennachführen (Zentrierung auf eigene Position)
     var isMapTrackingActive = true
     
+    // Automatisches Framing (Ausschnitt so wählen, dass alle Objekte sichtbar sind)
+    var isAutoFitAllActive = false
+    
     // Durchsatz-Raten für die Key-Value-Coding-Schnittstelle
     @objc var v2xRxRateBps: Double = 0.0
     @objc var gpsRxRateBps: Double = 0.0
@@ -1886,12 +1889,32 @@ class V2XHardwareManager: NSObject {
         }
     }
     
-    private func mockPayload(for id: Int) -> Data {
-        let b0 = UInt8((id >> 24) & 0xFF)
-        let b1 = UInt8((id >> 16) & 0xFF)
-        let b2 = UInt8((id >> 8) & 0xFF)
-        let b3 = UInt8(id & 0xFF)
-        return Data([b0, b1, b2, b3])
+    // Generiert ein robustes, ETSI-konformes Binärpaket für Simulationszwecke
+    private func mockPayload(type: UInt8, id: Int, lat: Double, lon: Double) -> Data {
+        var data = Data(repeating: 0, count: 20)
+        data[0] = type
+        
+        // Station ID (UInt32, Big Endian)
+        let idVal = UInt32(id).bigEndian
+        withUnsafeBytes(of: idVal) { data.replaceSubrange(1..<5, with: $0) }
+        
+        // Breitengrad im standardmäßigen ETSI-Format (* 10^7)
+        let latVal = Int32(lat * 10_000_000.0).bigEndian
+        withUnsafeBytes(of: latVal) { data.replaceSubrange(5..<9, with: $0) }
+        
+        // Längengrad im standardmäßigen ETSI-Format (* 10^7)
+        let lonVal = Int32(lon * 10_000_000.0).bigEndian
+        withUnsafeBytes(of: lonVal) { data.replaceSubrange(9..<13, with: $0) }
+        
+        // Standard Heading (120.0 Grad)
+        let headingVal = UInt16(1200).bigEndian
+        withUnsafeBytes(of: headingVal) { data.replaceSubrange(13..<15, with: $0) }
+        
+        // Standard Geschwindigkeit (50 km/h -> 13.88 m/s -> 1388 in m/s * 100)
+        let speedVal = UInt16(1388).bigEndian
+        withUnsafeBytes(of: speedVal) { data.replaceSubrange(15..<17, with: $0) }
+        
+        return data
     }
     
     // MARK: - System Simulationen & Debugging-Zähler
@@ -1943,82 +1966,96 @@ class V2XHardwareManager: NSObject {
     }
     
     private func triggerRandomSimulationStep() {
+        // Eigene Position als Ankerpunkt verwenden, ansonsten im Großraum Stuttgart simulieren (48.775, 9.182)
+        let centerLat = myLocation?.latitude ?? 48.775
+        let centerLon = myLocation?.longitude ?? 9.182
+        
+        let lat = centerLat + Double.random(in: -0.015...0.015)
+        let lon = centerLon + Double.random(in: -0.015...0.015)
+        
         let actions = [
-            simulateCAM, simulateDENM, simulateSPATEM,
-            simulateMAPEM, simulateIVIM, simulateCPM,
-            simulateSRM, simulateSSM, simulateMCM, simulateRTCMEM
+            { self.simulateCAM(lat: lat, lon: lon) },
+            { self.simulateDENM(lat: lat, lon: lon) },
+            { self.simulateSPATEM(lat: lat, lon: lon) },
+            { self.simulateMAPEM(lat: lat, lon: lon) },
+            { self.simulateIVIM(lat: lat, lon: lon) },
+            { self.simulateCPM(lat: lat, lon: lon) },
+            { self.simulateSRM(lat: lat, lon: lon) },
+            { self.simulateSSM(lat: lat, lon: lon) },
+            { self.simulateMCM(lat: lat, lon: lon) },
+            { self.simulateRTCMEM(lat: lat, lon: lon) }
         ]
         if let randomAction = actions.randomElement() {
             randomAction()
         }
     }
     
-    func simulateCAM() {
+    func simulateCAM(lat: Double, lon: Double) {
         let simulatedID = Int.random(in: 10...99) * 11 + 9
-        let dummyBytes = mockPayload(for: simulatedID)
+        let dummyBytes = mockPayload(type: 1, id: simulatedID, lat: lat, lon: lon)
         addDebugPacketLog("[SIM] Generiere CAM Paket für ID \(simulatedID)")
         parseV2X(dummyBytes)
     }
     
-    func simulateDENM() {
+    func simulateDENM(lat: Double, lon: Double) {
         let simulatedID = Int.random(in: 10...99) * 11 + 1
-        let dummyBytes = mockPayload(for: simulatedID)
+        let dummyBytes = mockPayload(type: 2, id: simulatedID, lat: lat, lon: lon)
         addDebugPacketLog("[SIM] Generiere DENM Paket für ID \(simulatedID)")
         parseV2X(dummyBytes)
     }
     
-    func simulateSPATEM() {
+    func simulateSPATEM(lat: Double, lon: Double) {
         let simulatedID = Int.random(in: 10...99) * 11
-        let dummyBytes = mockPayload(for: simulatedID)
+        let dummyBytes = mockPayload(type: 3, id: simulatedID, lat: lat, lon: lon)
         addDebugPacketLog("[SIM] Generiere SPATEM Paket für ID \(simulatedID)")
         parseV2X(dummyBytes)
     }
     
-    func simulateMAPEM() {
+    func simulateMAPEM(lat: Double, lon: Double) {
         let simulatedID = Int.random(in: 10...99) * 11 + 2
-        let dummyBytes = mockPayload(for: simulatedID)
+        let dummyBytes = mockPayload(type: 4, id: simulatedID, lat: lat, lon: lon)
         addDebugPacketLog("[SIM] Generiere MAPEM Paket für ID \(simulatedID)")
         parseV2X(dummyBytes)
     }
     
-    func simulateIVIM() {
+    func simulateIVIM(lat: Double, lon: Double) {
         let simulatedID = Int.random(in: 10...99) * 11 + 3
-        let dummyBytes = mockPayload(for: simulatedID)
+        let dummyBytes = mockPayload(type: 5, id: simulatedID, lat: lat, lon: lon)
         addDebugPacketLog("[SIM] Generiere IVIM Paket für ID \(simulatedID)")
         parseV2X(dummyBytes)
     }
     
-    func simulateCPM() {
+    func simulateCPM(lat: Double, lon: Double) {
         let simulatedID = Int.random(in: 10...99) * 11 + 4
-        let dummyBytes = mockPayload(for: simulatedID)
+        let dummyBytes = mockPayload(type: 6, id: simulatedID, lat: lat, lon: lon)
         addDebugPacketLog("[SIM] Generiere CPM Paket für ID \(simulatedID)")
         parseV2X(dummyBytes)
     }
     
-    func simulateSRM() {
+    func simulateSRM(lat: Double, lon: Double) {
         let simulatedID = Int.random(in: 10...99) * 11 + 5
-        let dummyBytes = mockPayload(for: simulatedID)
+        let dummyBytes = mockPayload(type: 7, id: simulatedID, lat: lat, lon: lon)
         addDebugPacketLog("[SIM] Generiere SRM Paket für ID \(simulatedID)")
         parseV2X(dummyBytes)
     }
     
-    func simulateSSM() {
+    func simulateSSM(lat: Double, lon: Double) {
         let simulatedID = Int.random(in: 10...99) * 11 + 6
-        let dummyBytes = mockPayload(for: simulatedID)
+        let dummyBytes = mockPayload(type: 8, id: simulatedID, lat: lat, lon: lon)
         addDebugPacketLog("[SIM] Generiere SSM Paket für ID \(simulatedID)")
         parseV2X(dummyBytes)
     }
     
-    func simulateMCM() {
+    func simulateMCM(lat: Double, lon: Double) {
         let simulatedID = Int.random(in: 10...99) * 11 + 7
-        let dummyBytes = mockPayload(for: simulatedID)
+        let dummyBytes = mockPayload(type: 9, id: simulatedID, lat: lat, lon: lon)
         addDebugPacketLog("[SIM] Generiere MCM Paket für ID \(simulatedID)")
         parseV2X(dummyBytes)
     }
     
-    func simulateRTCMEM() {
+    func simulateRTCMEM(lat: Double, lon: Double) {
         let simulatedID = Int.random(in: 10...99) * 11 + 8
-        let dummyBytes = mockPayload(for: simulatedID)
+        let dummyBytes = mockPayload(type: 10, id: simulatedID, lat: lat, lon: lon)
         addDebugPacketLog("[SIM] Generiere RTCMEM Paket für ID \(simulatedID)")
         parseV2X(dummyBytes)
     }
@@ -2129,6 +2166,20 @@ class V2XAnnotation: NSObject, MKAnnotation {
 // MARK: - V2XMapView (Brücke zwischen MKMapView und SwiftUI)
 struct V2XMapView: NSViewRepresentable {
     @Bindable var hardwareManager: V2XHardwareManager
+    
+    // Explizite Übergabe der observed-Eigenschaften, um SwiftUI's Observation-Update zu garantieren
+    var vehicles: [Int: V2XVehicle]
+    var trafficLights: [Int: V2XTrafficLight]
+    var dangerZones: [Int: V2XDangerZone]
+    var virtualSigns: [Int: V2XVirtualSign]
+    var collectiveObjects: [Int: V2XCollectiveObject]
+    var rtkCorrections: [Int: V2XRTKCorrection]
+    var myLocation: CLLocationCoordinate2D?
+    var isOfflineMapActive: Bool
+    var selectedMBTilesPath: String
+    var isMapTrackingActive: Bool
+    var isAutoFitAllActive: Bool
+    
     @Binding var selectedObject: SelectedObjectWrapper?
     
     struct SelectedObjectWrapper {
@@ -2147,10 +2198,10 @@ struct V2XMapView: NSViewRepresentable {
     func updateNSView(_ nsView: MKMapView, context: Context) {
         nsView.removeOverlays(nsView.overlays)
         
-        if hardwareManager.isOfflineMapActive {
+        if isOfflineMapActive {
             let tileOverlay: CachedTileOverlay
-            if !hardwareManager.selectedMBTilesPath.isEmpty {
-                let mbtilesURL = URL(fileURLWithPath: hardwareManager.selectedMBTilesPath)
+            if !selectedMBTilesPath.isEmpty {
+                let mbtilesURL = URL(fileURLWithPath: selectedMBTilesPath)
                 tileOverlay = CachedTileOverlay(mbtilesURL: mbtilesURL)
             } else {
                 tileOverlay = CachedTileOverlay()
@@ -2159,12 +2210,12 @@ struct V2XMapView: NSViewRepresentable {
             nsView.addOverlay(tileOverlay, level: .aboveRoads)
         }
         
-        for zone in hardwareManager.dangerZones.values {
+        for zone in dangerZones.values {
             let circle = MKCircle(center: zone.coordinate, radius: zone.radiusMeter)
             nsView.addOverlay(circle, level: .aboveRoads)
         }
         
-        for vehicle in hardwareManager.vehicles.values {
+        for vehicle in vehicles.values {
             if vehicle.history.count > 1 {
                 let polyline = MKPolyline(coordinates: vehicle.history, count: vehicle.history.count)
                 nsView.addOverlay(polyline, level: .aboveRoads)
@@ -2174,39 +2225,45 @@ struct V2XMapView: NSViewRepresentable {
         nsView.removeAnnotations(nsView.annotations)
         var newAnnotations: [V2XAnnotation] = []
         
-        if let myLoc = hardwareManager.myLocation {
+        if let myLoc = myLocation {
             let dummyVehicle = V2XVehicle(id: 0, coordinate: myLoc, heading: 0, speed: 0, isBraking: false, lastSeen: Date())
             newAnnotations.append(V2XAnnotation(coordinate: myLoc, title: "Eigene Position", subtitle: nil, object: .vehicle(dummyVehicle)))
         }
         
-        for vehicle in hardwareManager.vehicles.values {
+        for vehicle in vehicles.values {
             newAnnotations.append(V2XAnnotation(coordinate: vehicle.coordinate, title: "Auto #\(vehicle.id)", subtitle: "\(Int(vehicle.speed)) km/h", object: .vehicle(vehicle)))
         }
         
-        for light in hardwareManager.trafficLights.values {
+        for light in trafficLights.values {
             newAnnotations.append(V2XAnnotation(coordinate: light.coordinate, title: "Ampel #\(light.id)", subtitle: "\(light.currentPhase.uppercased()) (\(light.timeToChange)s)", object: .trafficLight(light)))
         }
         
-        for zone in hardwareManager.dangerZones.values {
+        for zone in dangerZones.values {
             newAnnotations.append(V2XAnnotation(coordinate: zone.coordinate, title: zone.type, subtitle: "Radius: \(Int(zone.radiusMeter))m", object: .dangerZone(zone)))
         }
         
-        for sign in hardwareManager.virtualSigns.values {
+        for sign in virtualSigns.values {
             newAnnotations.append(V2XAnnotation(coordinate: sign.coordinate, title: "Tempolimit", subtitle: "\(sign.value) km/h", object: .virtualSign(sign)))
         }
         
-        for obj in hardwareManager.collectiveObjects.values {
+        for obj in collectiveObjects.values {
             newAnnotations.append(V2XAnnotation(coordinate: obj.coordinate, title: obj.objectClass, subtitle: "CPM Objekt", object: .collectiveObject(obj)))
         }
         
-        for rtk in hardwareManager.rtkCorrections.values {
+        for rtk in rtkCorrections.values {
             newAnnotations.append(V2XAnnotation(coordinate: rtk.coordinate, title: "RTK Station #\(rtk.baseStationID)", subtitle: rtk.correctionStatus, object: .rtkCorrection(rtk)))
         }
         
         nsView.addAnnotations(newAnnotations)
         
-        // Kartennachführung (Auto-Centering & Following)
-        if hardwareManager.isMapTrackingActive, let myLoc = hardwareManager.myLocation {
+        // Auto-Framing: Wählt Kartenausschnitt so, dass ALLE annotations gleichzeitig sichtbar sind!
+        if isAutoFitAllActive {
+            let validAnnotations = nsView.annotations.filter { !($0 is MKUserLocation) }
+            if !validAnnotations.isEmpty {
+                nsView.showAnnotations(validAnnotations, animated: true)
+            }
+        } else if isMapTrackingActive, let myLoc = myLocation {
+            // Klassische Nachführung der eigenen GPS-Position
             let currentRegion = nsView.region
             let delta = 0.005
             if abs(currentRegion.center.latitude - myLoc.latitude) > delta || abs(currentRegion.center.longitude - myLoc.longitude) > delta {
@@ -2313,7 +2370,21 @@ struct V2XMapViewContainer: View {
     
     var body: some View {
         ZStack {
-            V2XMapView(hardwareManager: hardwareManager, selectedObject: $selectedObject)
+            V2XMapView(
+                hardwareManager: hardwareManager,
+                vehicles: hardwareManager.vehicles,
+                trafficLights: hardwareManager.trafficLights,
+                dangerZones: hardwareManager.dangerZones,
+                virtualSigns: hardwareManager.virtualSigns,
+                collectiveObjects: hardwareManager.collectiveObjects,
+                rtkCorrections: hardwareManager.rtkCorrections,
+                myLocation: hardwareManager.myLocation,
+                isOfflineMapActive: hardwareManager.isOfflineMapActive,
+                selectedMBTilesPath: hardwareManager.selectedMBTilesPath,
+                isMapTrackingActive: hardwareManager.isMapTrackingActive,
+                isAutoFitAllActive: hardwareManager.isAutoFitAllActive,
+                selectedObject: $selectedObject
+            )
             
             VStack {
                 HStack {
@@ -2327,8 +2398,13 @@ struct V2XMapViewContainer: View {
                             .font(.caption)
                             .toggleStyle(.checkbox)
                         
-                        // Toggle für optionale Zentrierung und Nachführung
                         Toggle("Automatisch nachführen (GPS)", isOn: $hardwareManager.isMapTrackingActive)
+                            .font(.caption)
+                            .toggleStyle(.checkbox)
+                            .disabled(hardwareManager.isAutoFitAllActive)
+                        
+                        // Neues Steuerungselement für Auto-Framing (Ausschnitt an alle Empfangsobjekte anpassen)
+                        Toggle("Kartenausschnitt an alle Objekte anpassen", isOn: $hardwareManager.isAutoFitAllActive)
                             .font(.caption)
                             .toggleStyle(.checkbox)
                         

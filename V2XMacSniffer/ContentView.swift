@@ -528,7 +528,8 @@ struct ContentView: View {
                                     .controlSize(.small)
                                     
                                     Button(action: {
-                                        hw.simulateCAM()
+                                        let center = hw.myLocation ?? CLLocationCoordinate2D(latitude: 48.7955, longitude: 9.2292)
+                                        hw.simulateCAM(lat: center.latitude, lon: center.longitude)
                                     }) {
                                         Label("CAM (PKW)", systemImage: "car.fill")
                                             .frame(maxWidth: .infinity)
@@ -1208,8 +1209,9 @@ struct DebugConsoleView: View {
 
                         HStack(spacing: 8) {
                             Button(action: {
-                                hw.simulateCAM()
-                                hw.simulateSPATEM()
+                                let center = hw.myLocation ?? CLLocationCoordinate2D(latitude: 48.775, longitude: 9.182)
+                                hw.simulateCAM(lat: center.latitude, lon: center.longitude)
+                                hw.simulateSPATEM(lat: center.latitude, lon: center.longitude)
                                 hw.addLog("[sim] Manuelle Signalsimulation aus der Debug-Zentrale ausgelöst.")
                             }) {
                                 Label("Jetzt simulieren", systemImage: "bolt.horizontal.fill")
@@ -1233,43 +1235,45 @@ struct DebugConsoleView: View {
                         Text("C-ITS SIGNAL-GENERATOR (HARDWARE-FREIE SIMULATION)").font(.caption).bold().foregroundColor(.secondary)
                         
                         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                            Button(action: { hw.simulateCAM() }) {
+                            let center = hw.myLocation ?? CLLocationCoordinate2D(latitude: 48.775, longitude: 9.182)
+                            
+                            Button(action: { hw.simulateCAM(lat: center.latitude, lon: center.longitude) }) {
                                 Label("CAM (Car)", systemImage: "car.fill")
                                     .frame(maxWidth: .infinity)
                             }
-                            Button(action: { hw.simulateDENM() }) {
+                            Button(action: { hw.simulateDENM(lat: center.latitude, lon: center.longitude) }) {
                                 Label("DENM (Hazard)", systemImage: "exclamationmark.triangle.fill")
                                     .frame(maxWidth: .infinity)
                             }
-                            Button(action: { hw.simulateSPATEM() }) {
+                            Button(action: { hw.simulateSPATEM(lat: center.latitude, lon: center.longitude) }) {
                                 Label("SPATEM (LSA)", systemImage: "traffic.light.fill")
                                     .frame(maxWidth: .infinity)
                             }
-                            Button(action: { hw.simulateMAPEM() }) {
+                            Button(action: { hw.simulateMAPEM(lat: center.latitude, lon: center.longitude) }) {
                                 Label("MAPEM (Lane)", systemImage: "map.fill")
                                     .frame(maxWidth: .infinity)
                             }
-                            Button(action: { hw.simulateIVIM() }) {
+                            Button(action: { hw.simulateIVIM(lat: center.latitude, lon: center.longitude) }) {
                                 Label("IVIM (Limit)", systemImage: "speedometer")
                                     .frame(maxWidth: .infinity)
                             }
-                            Button(action: { hw.simulateCPM() }) {
+                            Button(action: { hw.simulateCPM(lat: center.latitude, lon: center.longitude) }) {
                                 Label("CPM (Objects)", systemImage: "figure.walk")
                                     .frame(maxWidth: .infinity)
                             }
-                            Button(action: { hw.simulateSRM() }) {
+                            Button(action: { hw.simulateSRM(lat: center.latitude, lon: center.longitude) }) {
                                 Label("SRM (Priority Req)", systemImage: "light.beacon.max.fill")
                                     .frame(maxWidth: .infinity)
                             }
-                            Button(action: { hw.simulateSSM() }) {
+                            Button(action: { hw.simulateSSM(lat: center.latitude, lon: center.longitude) }) {
                                 Label("SSM (Priority OK)", systemImage: "checkmark.shield.fill")
                                     .frame(maxWidth: .infinity)
                             }
-                            Button(action: { hw.simulateMCM() }) {
+                            Button(action: { hw.simulateMCM(lat: center.latitude, lon: center.longitude) }) {
                                 Label("MCM (Cooperation)", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
                                     .frame(maxWidth: .infinity)
                             }
-                            Button(action: { hw.simulateRTCMEM() }) {
+                            Button(action: { hw.simulateRTCMEM(lat: center.latitude, lon: center.longitude) }) {
                                 Label("RTCMEM (RTK)", systemImage: "antenna.radiowaves.left.and.right")
                                     .frame(maxWidth: .infinity)
                             }
