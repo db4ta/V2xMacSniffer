@@ -337,3 +337,32 @@ public enum GeoSanity {
  }
 */
 
+// MARK: - UPER alias for clarity
+public typealias UPERBitReader = BitReader
+
+// MARK: - Additional C-ITS field helpers
+public extension CITSDecoding {
+    /// Decodes ETSI heading (typisch 12 Bit, 0.1° Auflösung). Ergebnis in Grad [0, 360).
+    /// Hinweis: Konkrete Bitbreite/Skalierung je nach Nachrichtentyp prüfen (CAM, DENM, SPATEM, MAPEM).
+    static func decodeHeading(_ reader: inout BitReader, bits: Int = 12, scale: Double = 0.1) -> Double? {
+        guard let raw = reader.readBits(bits) else { return nil }
+        let deg = Double(raw) * scale
+        // Begrenze auf [0, 360)
+        if deg >= 360.0 { return deg.truncatingRemainder(dividingBy: 360.0) }
+        if deg < 0.0 { return (deg.truncatingRemainder(dividingBy: 360.0) + 360.0).truncatingRemainder(dividingBy: 360.0) }
+        return deg
+    }
+
+    /// Decodes speed with given bit width and scale. Example: 16 Bits, 0.01 m/s etc.
+    static func decodeSpeed(_ reader: inout BitReader, bits: Int, scale: Double) -> Double? {
+        decodeUnsignedScaled(&reader, bits: bits, scale: scale)
+    }
+}
+
+// MARK: - Guarded extraction helpers
+public enum SafeExtract {
+    /// Returns nil if value is out of plausible latitude range.
+    public static func latitude(_ lat: Double) -> Double? { GeoSanity.normalizeLatitude(lat) }
+    /// Always wraps longitude to [-180, 180].
+    public static func longitude(_ lon: Double) -> Double { GeoSanity.wrapLongitude(lon) }
+}
