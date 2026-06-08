@@ -216,13 +216,20 @@ final class V2XHardwareManager: NSObject {
         }
         
         // 2. Extrahiere Metadaten aus dem GeoNetworking Common & Extended Header
-        let latRaw = gnPayload.subdata(in: 20..<24).withUnsafeBytes { $0.load(as: Int32.self).bigEndian }
-        let lonRaw = gnPayload.subdata(in: 24..<28).withUnsafeBytes { $0.load(as: Int32.self).bigEndian }
+        // Richtige Offsets: 
+        // Basic Header (4 B) + Common Header (8 B) = 12 B. 
+        // Extended Header (LPV) startet ab Byte 12: 
+        //   GN_ADDR: 8 B (12..<20), 
+        //   Timestamp: 4 B (20..<24), 
+        //   Latitude: 4 B (24..<28), 
+        //   Longitude: 4 B (28..<32)
+        let latRaw = gnPayload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 24, as: Int32.self).bigEndian }
+        let lonRaw = gnPayload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 28, as: Int32.self).bigEndian }
         
         let latitude = Double(latRaw) / 10_000_000.0
         let longitude = Double(lonRaw) / 10_000_000.0
         
-        // Plausibilitätsprüfung für die Region B29 (Aalen/Waiblingen) -> Lat ~48.8, Lon ~9.3-10.2
+        // Plausibilitätsprüfung für die Region (Deutschland / Baden-Württemberg Korridor)
         guard latitude > 45.0 && latitude < 55.0 && longitude > 5.0 && longitude < 16.0 else {
             let errorMsg = "Ungültige Geodaten verworfen: Lat \(latitude), Lon \(longitude) (Erwartet B29 Korridor)"
             addLog("[warn] \(errorMsg)")
@@ -231,22 +238,41 @@ final class V2XHardwareManager: NSObject {
             return
         }
         
-        // Lese Geschwindigkeits- & Richtungswerte aus dem GN LongPositionVector
-        let speedRaw = gnPayload.subdata(in: 28..<30).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
-        let headingRaw = gnPayload.subdata(in: 30..<32).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
-        let speedKmH = Double(speedRaw) * 0.01 * 3.6 // GN Speed ist in 0.01 m/s angegeben
+        // Lese Geschwindigkeits- & Richtungswerte aus dem LPV (Bytes 32 und 34)
+        let speedRaw = gnPayload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 32, as: UInt16.self).bigEndian }
+        let headingRaw = gnPayload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 34, as: UInt16.self).bigEndian }
+        
+        // MSB von Speed ausmaskieren (0x7FFF) und in km/h umrechnen (Einheit ist 0.01 m/s)
+        let speedVal = speedRaw & 0x7FFF
+        let speedKmH = Double(speedVal) * 0.01 * 3.6
         let headingDeg = Double(headingRaw) * 0.1     // GN Heading in 0.1 Grad
         
-        // 3. Bestimme den Nachrichtentyp anhand des BTP-Ports (BTP-Header ab Offset 36 im GN-Payload)
-        guard gnPayload.count >= 40 else {
-            addLog("[warn] BTP-Header fehlt. Paketlänge unzureichend.")
-            sysLogger.warning("BTP-Header konnte nicht extrahiert werden, Payload-Länge: \(gnPayload.count)")
+        // 3. Bestimme den nachgelagerten BTP-Header-Offset dynamisch anhand des GN-Header-Typs (HT)
+        // HT ist in den oberen 4 Bits von Byte 5 im Common-Header hinterlegt.
+        let headerTypeByte = gnPayload[5]
+        let headerType = (headerTypeByte >> 4) & 0x0F
+        
+        let btpOffset: Int
+        switch headerType {
+        case 1, 2: // SHB, TSB -> Extended Header ist 28 Bytes lang
+            btpOffset = 40
+        case 3, 4: // GBC, GAC -> Extended Header ist 44 Bytes lang
+            btpOffset = 56
+        case 5:    // GeoUnicast -> Extended Header ist 36 Bytes lang
+            btpOffset = 48
+        default:   // Fallback auf SHB/TSB Standard
+            btpOffset = 40
+        }
+        
+        guard gnPayload.count >= btpOffset + 4 else {
+            addLog("[warn] BTP-Header fehlt oder Paket abgeschnitten. Offset: \(btpOffset), Payload-Größe: \(gnPayload.count)")
             return
         }
-        let destPort = gnPayload.subdata(in: 36..<38).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
         
-        // C-ITS ASN.1 Payload startet hinter dem 4-Byte BTP-Header
-        let asnPduData = gnPayload.subdata(in: 40..<gnPayload.count)
+        let destPort = gnPayload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: btpOffset, as: UInt16.self).bigEndian }
+        
+        // C-ITS ASN.1 Payload startet exakt hinter dem 4-Byte BTP-Header
+        let asnPduData = gnPayload.subdata(in: btpOffset + 4..<gnPayload.count)
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
         
         sysLogger.debug("GN-Paket erkannt: Lat \(latitude), Lon \(longitude), Speed \(speedKmH) km/h, BTP-Port \(destPort)")
@@ -303,6 +329,18 @@ final class V2XHardwareManager: NSObject {
             }
             writeToCSVLine("\(timestamp);SPATEM;\(lightID);\(latitude);\(longitude);0.0;0.0;false;green_15s\n")
             sysLogger.info("SPATEM (Ampelsteuerung) registriert auf Lat: \(latitude), Lon: \(longitude)")
+        } else if destPort == 2003 { // MAPEM Port
+            decodedMAPEMs += 1
+            addLog("[V2X] MAPEM (Topologie) empfangen auf Lat: \(latitude), Lon: \(longitude)")
+            writeToCSVLine("\(timestamp);MAPEM;0;\(latitude);\(longitude);0.0;0.0;false;topology\n")
+        } else if destPort == 2006 { // IVIM Port
+            decodedIVIMs += 1
+            addLog("[V2X] IVIM (Verkehrsschild) empfangen auf Lat: \(latitude), Lon: \(longitude)")
+            writeToCSVLine("\(timestamp);IVIM;0;\(latitude);\(longitude);0.0;0.0;false;signage\n")
+        } else if destPort == 2009 { // CPM Port
+            decodedCPMs += 1
+            addLog("[V2X] CPM (Sensorkollektiv) empfangen auf Lat: \(latitude), Lon: \(longitude)")
+            writeToCSVLine("\(timestamp);CPM;0;\(latitude);\(longitude);0.0;0.0;false;collective_perception\n")
         } else {
             sysLogger.debug("Unbekannter C-ITS Zielport empfangen: \(destPort)")
         }
