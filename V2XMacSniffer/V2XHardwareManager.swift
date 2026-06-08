@@ -104,6 +104,50 @@ final class V2XHardwareManager: NSObject {
     private var v2xHandle: FileHandle?
     private var gpsHandle: FileHandle?
     private var shouldReadSerial: Bool = false
+
+    // MARK: - Firmware Stream Synchronization (Magic Bytes + Big-Endian Length)
+    // Adjust magic bytes (0xAA, 0xBB) and framing to match your firmware if needed
+    private var v2xStreamBuffer = Data()
+    
+    private func processIncomingStream(data: Data) {
+        // Append incoming chunk to rolling buffer
+        v2xStreamBuffer.append(data)
+        var index = 0
+        // We need at least 4 bytes to search for magic + length
+        while index <= v2xStreamBuffer.count - 4 {
+            // 1) Synchronize on firmware magic bytes (example: 0xAA 0xBB)
+            if v2xStreamBuffer[index] == 0xAA && v2xStreamBuffer[index + 1] == 0xBB {
+                // 2) Read payload length (big-endian UInt16)
+                let lengthRange = (index + 2)..<(index + 4)
+                let lengthBytes = v2xStreamBuffer.subdata(in: lengthRange)
+                let payloadLength = Int(uint16FromBigEndian(lengthBytes))
+                let startOfPayload = index + 4
+                let endOfPayload = startOfPayload + payloadLength
+                // 3) Ensure the full payload is present in the buffer
+                if endOfPayload <= v2xStreamBuffer.count {
+                    let v2xPayload = v2xStreamBuffer.subdata(in: startOfPayload..<endOfPayload)
+                    // 4) Hand off to the existing decoder pipeline
+                    self.parseV2XBytes(v2xPayload)
+                    // Advance index to the end of the consumed frame
+                    index = endOfPayload
+                } else {
+                    // Incomplete frame: stop here and wait for more data
+                    break
+                }
+            } else {
+                // Not aligned yet: continue searching
+                index += 1
+            }
+        }
+        // Drop consumed bytes from the front of the buffer
+        if index > 0 {
+            v2xStreamBuffer.removeSubrange(0..<index)
+        }
+    }
+    
+    private func uint16FromBigEndian(_ data: Data) -> UInt16 {
+        return data.withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
+    }
     
     override init() {
         super.init()
@@ -388,23 +432,16 @@ final class V2XHardwareManager: NSObject {
                 self.v2xPortOpen = true
                 self.shouldReadSerial = true
                 addLog("[+] V2X-Modem aktiv auf: \(selectedV2XPort)")
+                addLog("[Info] Verwende Firmware-Framing (Magic 0xAA 0xBB, Big-Endian Länge)")
                 
-                // Serial-Reader Thread für SLIP (0xC0-Framing)
+                // Serial-Reader Thread for firmware framing (magic 0xAA 0xBB + BE length)
                 Thread.detachNewThread { [weak self] in
-                    var buffer = Data()
                     while self?.shouldReadSerial == true {
                         guard let self = self, let handle = self.v2xHandle else { break }
                         do {
-                            if let data = try handle.read(upToCount: 256), !data.isEmpty {
-                                buffer.append(data)
-                                while let endIndex = buffer.firstIndex(of: 0xC0) {
-                                    let packet = buffer.subdata(in: 0..<endIndex)
-                                    buffer.removeSubrange(0...endIndex)
-                                    if !packet.isEmpty {
-                                        let cleanPayload = SLIPDecoder.decode(rawBytes: packet)
-                                        self.parseV2XBytes(cleanPayload)
-                                    }
-                                }
+                            if let chunk = try handle.read(upToCount: 512), !chunk.isEmpty {
+                                // Feed chunk into firmware-framed stream processor (magic 0xAA 0xBB + BE length)
+                                self.processIncomingStream(data: chunk)
                             } else {
                                 try Thread.sleep(forTimeInterval: 0.005)
                             }
